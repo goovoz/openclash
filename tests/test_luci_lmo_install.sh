@@ -36,6 +36,10 @@ PIN="$ROOT/runtime/upstream/pin-lua-interpreter.sh"
 BUILD_DEB="$ROOT/scripts/build-deb.sh"
 VENDOR="$ROOT/vendor/luci"
 
+# ⚠️ 不要假设 git 保留了 +x bit：本地 Windows 上文件系统永远显示 +x（mingw shim），
+#   但 git tree mode 是 100644；CI Linux runner checkout 也是 644。
+#   显式 chmod 一次最稳（chmod 在 mingw 上是 no-op，不影响 Windows）。
+[ -x "$LMO_INSTALL" ] || chmod +x "$LMO_INSTALL" 2>/dev/null || true
 [ -x "$LMO_INSTALL" ] || { echo "找不到 $LMO_INSTALL"; exit 2; }
 
 # --- A. 工具与 vendro 树存在性 ---

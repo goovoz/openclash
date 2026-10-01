@@ -40,6 +40,10 @@ VENDOR="$ROOT/vendor/luci"
 PIN="$ROOT/runtime/upstream/pin-lua-interpreter.sh"
 BUILD_DEB="$ROOT/scripts/build-deb.sh"
 
+# ⚠️ 不要假设 git 保留了 +x bit：本地 Windows 上文件系统永远显示 +x（mingw shim），
+#   但 git tree mode 是 100644；CI Linux runner checkout 也是 644。
+#   显式 chmod 一次最稳（chmod 在 mingw 上是 no-op，不影响 Windows）。
+[ -x "$IVL" ]     || chmod +x "$IVL" 2>/dev/null || true
 [ -f "$IVL" ]     || { printf '\033[31m[fatal]\033[0m 缺少 %s\n' "$IVL"; exit 1; }
 [ -d "$VENDOR" ]  || { printf '\033[31m[fatal]\033[0m 缺少 %s（先跑 fetch-luci-vendor.sh）\n' "$VENDOR"; exit 1; }
 [ -f "$PIN" ]     || { printf '\033[31m[fatal]\033[0m 缺少 %s\n' "$PIN"; exit 1; }
