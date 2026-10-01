@@ -277,8 +277,14 @@ it "C4. 静态纪律：Lua 5.1 是硬断言而不是注释"
 # =============================================================================
 # 拿 5.3/5.4 的头编出来的 .so 在 5.1 解释器里 require 会报 undefined symbol，
 # 所以必须在构建期就把版本挡住，而不是写一句"请用 5.1"的注释。
+# ⚠️ 这里原本写成 grep -cF 'LUA_VERSION_NUM[ \t]+501' —— `-F`（固定字符串）
+#   配合了 regex 元字符 `[ \t]+`，**永远匹配不到**，但该断言期望 1，于是长期恒红。
+#   2026-10-01 修：锚定真判据那一行的**字面**形态（build-common.sh:118 的
+#   grep -qE '^#[[:space:]]*define[[:space:]]+LUA_VERSION_NUM[[:space:]]+501'），
+#   它在公共层里唯一出现；die 文案里那句 "未找到 LUA_VERSION_NUM 501" 不含
+#   define 段，不会被数进来。
 chk "C4 断言 LUA_VERSION_NUM 501（公共层）" \
-	"$(grep -cF 'LUA_VERSION_NUM[ \t]+501' "$COMMON_SH" || true)" "1"
+	"$(grep -cF 'define[[:space:]]+LUA_VERSION_NUM[[:space:]]+501' "$COMMON_SH" || true)" "1"
 # 断言「唯一的版本断言在公共层，且构建脚本确实引入了它」。
 # 早先这里数的是 BUILD_SH 里 LUA_VERSION_NUM 的出现次数 == 0 —— 但注释里提一句
 # 也算命中，这种断言会被无关改动误伤。改成数真正的 source 语句。
