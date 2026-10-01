@@ -473,17 +473,30 @@ chk_body_contains "B4b img.gif mime" "Content-Type: image/gif"
 curl_to "$B_PORT" "/luci-static/missing.txt"
 chk_http_status "B5 /luci-static/missing.txt" "404"
 
-# B6: 路径逃逸 → 403（先看实际 host 怎么处理 ../）
-#     现实：浏览器 / curl 都不会把 /../ 在请求行里发；攻击者手写。
-#     这里我直接用 socat 构造一条 raw 请求做断言锁。
-#     否则 host 会在路由前就因 "/luci-static/../etc/passwd" 不在 sub 内而被拆为 403
-#     —— 但具体路径解析依赖 realpath，需要在 host 里加 "../" 检测。
-{
-	printf 'GET /luci-static/../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n'
-	sleep 0.3
-} | socat - TCP:127.0.0.1:$B_PORT 2>/dev/null | head -1 > "$TMP/curl.body"
-echo "$(awk 'NR==1{print $2}' "$TMP/curl.body")" > "$TMP/status"
-chk_http_status "B6 path traversal" "403"
+# B6: 路径逃逸 → 403
+#     现实：浏览器 / curl 默认都不会把 /../ 原样发在请求行里（curl 会先规范化），
+#     攻击者是手写 raw 请求。所以这条断言的关键是**不让 curl 规范化路径**。
+#
+#     原实现用 socat 拼 raw TCP，但 socat 不是每台机器都有 —— CI 的
+#     ubuntu-24.04 runner 上就没装，于是整条管道失败、\$TMP/curl.body 为空、
+#     status 为空，报出一条看不懂的 `B6 path traversal (got= want=403)`
+#     （2026-10-01 实测：CI 638 PASS / 1 FAIL 里那 1 个就是它）。
+#
+#     改用 curl 自带的 --path-as-is（curl >= 7.42，2015 年就有）：
+#     它让 curl 原样发送 /luci-static/../etc/passwd。
+#     已在 Debian 上与 socat raw 请求做过等价对比：
+#         socat raw        → HTTP/1.1 403 Forbidden
+#         curl --path-as-is → status=403          ← 一致
+#         curl 默认（会规范化成 /etc/passwd）→ 404  ← 证明该参数确实必要
+curl --path-as-is -s -o "$TMP/curl.body" -w '%{http_code}' \
+	"http://127.0.0.1:$B_PORT/luci-static/../etc/passwd" \
+	>"$TMP/status" 2>"$TMP/curl.err" || true
+# curl 太老不支持 --path-as-is 时必须 fail-loud，不能静默变成 "通过"
+if grep -qE "unknown option|--path-as-is" "$TMP/curl.err" 2>/dev/null; then
+	fail "B6 path traversal（curl 不支持 --path-as-is，无法验证逃逸）"
+else
+	chk_http_status "B6 path traversal" "403"
+fi
 
 # B7: unknown → 404
 curl_to "$B_PORT" "/some/unknown/path"
