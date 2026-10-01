@@ -60,22 +60,34 @@ jobs:
         # 之前这里没有 id/continue-on-error，于是「同步成功但上游改动了我们依赖
         # 的写法」这一类回归**完全静默** —— 工作流直接红掉，却没有任何人被告知
         # 究竟是哪条适配失效了。
+        #
+        # 每个 test 都用 `|| { rc=$?; ... }` 兜底 —— GitHub Actions 的 Linux runner
+        # 默认 shell 是 `bash -eo pipefail {0}`，不带 `||` 的命令一旦失败就被外层
+        # -e 截停，让后续 4 个 test 整个被跳过。**这次真回归永远测不到**就是 2026-10-01
+        # 发现的：
+        #   test_procd_shim FAIL → 跳 test_upstream_load/test_pin_lua/
+        #   test_luci_vendor_install/test_luci_lmo_install。
+        # COMPAT_RC 累计「最后一个失败 test 的 rc」足够：5 个都跑完 + 任一失败 → step
+        # outcome=failure → issue 自动开。
         continue-on-error: true
         run: |
           set -o pipefail
-          bash tests/test_procd_shim.sh
-          bash tests/test_upstream_load.sh
+          COMPAT_RC=0
+          bash tests/test_procd_shim.sh          || { rc=$?; echo "::warning::test_procd_shim FAIL rc=$rc";          COMPAT_RC=$rc; }
+          bash tests/test_upstream_load.sh       || { rc=$?; echo "::warning::test_upstream_load FAIL rc=$rc";       COMPAT_RC=$rc; }
           # ★ 新增：上游对「系统 lua = 5.1」的 11 处依赖是否仍是我们测绘过的那几种形态。
           #   这是本项目**唯一**会对"上游改了调用写法"发出告警的检查：
           #   上游若把 `lua /path` 改成 `lua -e ...`，pin-lua-interpreter.sh 的宽判据
           #   会命中而窄规则覆盖不到 → 直接失败并打印 file:line（见 docs/04 §2.3）。
-          bash tests/test_pin_lua.sh
-          bash tests/test_luci_vendor_install.sh
+          bash tests/test_pin_lua.sh             || { rc=$?; echo "::warning::test_pin_lua FAIL rc=$rc";             COMPAT_RC=$rc; }
+          bash tests/test_luci_vendor_install.sh || { rc=$?; echo "::warning::test_luci_vendor_install FAIL rc=$rc"; COMPAT_RC=$rc; }
           # ★ 新增：上游对「vendor LuCI i18n 编译链」的依赖是否仍是 po2lmo.c 一个文件。
           #   这条专门盯"上游改了 po2lmo.c（拆出 .o、增加 template_lmo.c 依赖、改要
           #   lemon/flex）"这些工具链结构变更：上游若把 po2lmo 拆成 po2lmo.c +
           #   template_lmo.c，install-vendor-lmo.sh 的"独立编译"锁会立刻命中而锁不动。
-          bash tests/test_luci_lmo_install.sh
+          bash tests/test_luci_lmo_install.sh    || { rc=$?; echo "::warning::test_luci_lmo_install FAIL rc=$rc";    COMPAT_RC=$rc; }
+          echo "compat total rc=$COMPAT_RC"
+          exit $COMPAT_RC
 
       - name: Commit synced upstream
         if: steps.sync.outcome == 'success' && steps.diff.outputs.changed == 'true'
