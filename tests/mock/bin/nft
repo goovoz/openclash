@@ -233,7 +233,11 @@ case "$ACTION" in
 			table)
 				if [ "$#" -ge 2 ]; then _list_table "$1" "$2"
 				elif [ "$#" -eq 1 ]; then
-					local d
+					# ⚠️ 这里原本有 `local d`（shellcheck SC2168 error）。
+					#   本文件是 #!/bin/sh —— 在 Debian 的 dash 下，函数体**之外**
+					#   使用 local 会真的报 `local: not in a function` 并让整个
+					#   case 分支失效（bash 里只是宽松放行，所以本地测不出来）。
+					#   这个 for 循环的变量本来就不需要预声明，去掉即可。
 					for d in "$STATE"/*/; do
 						[ -d "$d" ] || continue
 						t="$(basename "$d")"

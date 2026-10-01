@@ -97,8 +97,12 @@ log "最新提交: $SUBJECT"
 
 # --- 2. 同步文件到 upstream/ -------------------------------------------------
 # 保留 .checkout 作为 git 工作区，upstream/luci-app-openclash 作为「可用副本」
-rm -rf "$DEST/$SPARSE_PATH"
-cp -a "$CHECKOUT/$SPARSE_PATH" "$DEST/$SPARSE_PATH"
+# ⚠️ ${DEST:?} 与 ${SPARSE_PATH:?} 是**必须的**（shellcheck SC2115）：这两个变量
+#   任一为空，`rm -rf "$DEST/$SPARSE_PATH"` 就退化成 `rm -rf "/xxx"` 甚至
+#    `rm -rf /` —— 而本脚本天天由 CI 无人值守地跑，没有交互确认兜底。
+#   用 :? 让它在空值时**立即失败**并打印变量名，而不是去删根目录。
+rm -rf "${DEST:?}/$(printf '%s' "${SPARSE_PATH:?}")"
+cp -a "$CHECKOUT/${SPARSE_PATH:?}" "$DEST/${SPARSE_PATH:?}"
 
 cat >"$VER_FILE" <<EOF
 BRANCH=$BRANCH

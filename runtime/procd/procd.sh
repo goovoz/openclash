@@ -455,7 +455,12 @@ _procd_status() {
 		_oc_systemctl status --no-pager "$(_oc_unit_of "$instance")"
 		return $?
 	fi
-	_oc_systemctl status --no-pager "$(basename "$initscript")" 2>/dev/null
+	# ⚠️ 这里原本写 `basename "$initscript"`，但 $initscript 在本函数里**从未赋值**
+	#   （shellcheck SC2154）。上游的 $initscript 是 rc.common 的全局变量，而
+	#   _procd_status 是"未被上游使用"的空实现，从没人给它传过值 —— 一旦真被
+	#   调到，set -u 下直接崩，不带 set -u 则 basename "" 得到 "."。
+	#   修：回退到本函数的入参 $service（语义也对：查的就是这个服务）。
+	_oc_systemctl status --no-pager "$(basename "${initscript:-$service}")" 2>/dev/null
 	return $?
 }
 

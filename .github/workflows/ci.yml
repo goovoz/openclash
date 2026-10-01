@@ -15,16 +15,24 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint runtime and scripts
+        # 为什么分两次跑、且门禁只卡 error：
+        #   2026-10-01 实测这 30 个脚本共 106 个 finding，分布是
+        #     error 0 / warning 18 / info 79 / style 3
+        #   —— 也就是说**一个真错误都没有**，但 shellcheck 对 info/style 也返回 1，
+        #   于是 CI 长期红在 Lint，把"有真 bug"和"风格建议"混为一谈，
+        #   真正的 error 反而淹没在 106 行噪音里没人看。
+        #
+        # 第 1 遍：全量输出（参考用，不阻塞）—— warning 里确实出过真问题
+        #   （procd.sh 的 $initscript 未赋值、uci.sh 的 `[ -o ]`、sync-upstream
+        #   的 rm -rf 缺 ${var:?}），这些要留给人看，不能因为门禁放宽就消失。
+        # 第 2 遍：`-S error` 只让 error 级失败（真正的语法/逻辑 bug）。
         run: |
           set -o pipefail
-          shellcheck -s sh -e SC1090,SC1091,SC2034,SC3043 \
-            runtime/procd/rc.common \
-            runtime/procd/procd.sh \
-            runtime/shell/service.sh \
-            runtime/shell/config/uci.sh \
-            packaging/debian/postinst \
-            packaging/debian/prerm \
-            packaging/debian/postrm
+          SC_SH="runtime/procd/rc.common runtime/procd/procd.sh runtime/shell/service.sh \
+            runtime/shell/config/uci.sh packaging/debian/postinst \
+            packaging/debian/prerm packaging/debian/postrm"
+          # 第 1 遍：全量报告（参考，不阻塞）
+          shellcheck -s sh -e SC1090,SC1091,SC2034,SC3043 $SC_SH || true
           shellcheck -s bash \
             scripts/sync-upstream.sh \
             scripts/fetch-luci-vendor.sh \
@@ -54,9 +62,44 @@ jobs:
             tests/test_maintainer_scripts.sh \
             tests/test_luci_vendor_install.sh \
             tests/test_luci_lmo_install.sh \
+            tests/e2e/linux/run-e2e.sh || true
+          shellcheck -s sh tests/mock/bin/systemctl || true
+          shellcheck -s bash tests/mock/bin/uci tests/mock/bin/nft || true
+
+          # 第 2 遍：门禁 —— 只有 error 级才让 CI 红
+          shellcheck -s sh -S error -e SC1090,SC1091,SC2034,SC3043 $SC_SH
+          shellcheck -s bash -S error \
+            scripts/sync-upstream.sh \
+            scripts/fetch-luci-vendor.sh \
+            scripts/build-deb.sh \
+            runtime/uci/build-uci.sh \
+            runtime/net/fw4 \
+            runtime/net/prepare-tmp.sh \
+            runtime/net/dnsmasq-adapter.sh \
+            runtime/sys/openwrt-release.sh \
+            runtime/lua/build-lua-modules.sh \
+            runtime/lua/lua-path-bridge.sh \
+            runtime/lua/lib/upstream-parsers.sh \
+            runtime/lib/build-common.sh \
+            runtime/ubus/build-ubus.sh \
+            runtime/upstream/pin-lua-interpreter.sh \
+            scripts/install-vendor-luci.sh \
+            scripts/install-vendor-lmo.sh \
+            tests/run-all.sh \
+            tests/test_procd_shim.sh \
+            tests/test_upstream_load.sh \
+            tests/test_fw4_shim.sh \
+            tests/test_dns_prep.sh \
+            tests/test_openwrt_release.sh \
+            tests/test_lua_parsers.sh \
+            tests/test_lua_path_bridge.sh \
+            tests/test_pin_lua.sh \
+            tests/test_maintainer_scripts.sh \
+            tests/test_luci_vendor_install.sh \
+            tests/test_luci_lmo_install.sh \
             tests/e2e/linux/run-e2e.sh
-          shellcheck -s sh tests/mock/bin/systemctl
-          shellcheck -s bash tests/mock/bin/uci tests/mock/bin/nft
+          shellcheck -s sh -S error tests/mock/bin/systemctl
+          shellcheck -s bash -S error tests/mock/bin/uci tests/mock/bin/nft
 
   test:
     name: Unit & load tests
@@ -67,15 +110,70 @@ jobs:
         # lua5.1 是 lua-path-bridge.sh 的探测对象：它要问解释器"你的默认
         # 搜索路径是什么"，没有解释器就只能退化到 --apply 的兜底分支，
         # C1/C2/C3 那组断言就失去意义了。
+        #
+        # build-essential / liblua5.1-0-dev / libjson-c-dev 是给下一步
+        # build-lua-modules.sh 准备的 —— 它要在 CI 上现场编译 Lua C 模块。
+        #
+        # ★ nixio.so 是 test_luci_host 的**硬依赖**（P3 HTTP 宿主的
+        #   runtime/sys/luci-host.lua 顶层 require），没有它 A1「启不来」，
+        #   整套 40 个断言里 36 个连带失败 —— CI 长期报 603 PASS / 36 FAIL
+        #   就是因为这一步只装了解释器而没产出 C 模块。
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lua5.1
+          sudo apt-get install -y --no-install-recommends \
+            lua5.1 build-essential cmake pkg-config \
+            liblua5.1-0-dev libjson-c-dev
+
       - name: Sync upstream (needed by load test)
         run: bash scripts/sync-upstream.sh
       - name: Ensure LuCI vendor tree
         # vendor/ 若已提交则跳过（脚本内部用 diff 判等，本步是幂等的）；
         # 未提交时现场拉取。两种情形 CI 都应能跑通。
         run: bash scripts/fetch-luci-vendor.sh
+
+      - name: Build Lua C modules + bridge (needed by test_luci_host)
+        # ⚠️ 必须排在 Sync upstream / Ensure LuCI vendor tree **之后**：
+        #   build-lua-modules.sh 从 vendor/luci 取源码编译，vendor 树这时还没
+        #   落盘就直接编，只会拿到"缺少 luci-base/src/..."的硬失败。
+        #
+        # ⚠️ 必须与 Debian 真机验收环境一致。Debian 上这套产物最终在三个位置：
+        #     /usr/lib/lua/nixio.so            ← 上游契约落点（build-lua-modules）
+        #     /usr/lib/lua/5.1/nixio.so        ← lua-path-bridge 建的软链
+        #     /usr/lib/x86_64-linux-gnu/lua/5.1/nixio.so   ← 同上
+        #   少任何一环 `require "nixio"` 都失败。CI 若跳过本步，宿主连 nixio
+        #   都 require 不到 —— 测的就**不是 HTTP 逻辑**而是"缺依赖"
+        #   （旧 CI 长期 603 PASS / 36 FAIL，36 个全是 test_luci_host 连带失败）。
+        #
+        # ★ 第二道坑（build-lua-modules.sh 收尾自己会打印这句）：
+        #   Debian 的 lua5.1 默认 cpath 认 /usr/lib/lua/5.1/，**不认** /usr/lib/lua/。
+        #   所以只 cp 是不够的，必须再跑 lua-path-bridge.sh --apply 补软链，
+        #   否则 /usr/lib/lua/nixio.so 存在但 require 找不到。
+        #
+        # 最后做权威校验：不带任何 LUA_CPATH/LUA_PATH 地 require（同 build-deb
+        # job 的判据）——模拟"装到系统上之后"的真实可见性。
+        run: |
+          set -euo pipefail
+          SP="$RUNNER_TEMP/lua-modules"
+          bash runtime/lua/build-lua-modules.sh --destdir "$SP" 2>&1 | tail -12
+          sudo cp -a "$SP"/usr/lib/lua/. /usr/lib/lua/
+          sudo cp -a "$SP"/usr/lib/x86_64-linux-gnu/. /usr/lib/x86_64-linux-gnu/
+          sudo cp -a "$SP"/usr/bin/po2lmo /usr/bin/po2lmo
+          sudo ldconfig
+          sudo bash runtime/lua/lua-path-bridge.sh --apply
+          sudo bash runtime/lua/lua-path-bridge.sh --check
+          echo "── 权威校验：默认搜索路径 require（不带任何 LUA_*）──"
+          # ⚠️ 刻意用 Lua 自己的 ipairs 循环列举，不写 bash for + 变量插值：
+          #   `$m` 插进 lua 的 '...' 字符串会与多层引号打架，SSH/YAML 里都能
+          #   转义坏掉报 `unexpected symbol near ')'`，掩盖真问题（2026-10-01 踩过）。
+          lua5.1 -e 'local bad=0
+            for _,m in ipairs{"nixio","nixio.fs","lucihttp","luci.ip","luci.jsonc"} do
+              local ok,e = pcall(require, m)
+              print(string.format("  %-12s %s", m, ok and "OK" or ("FAIL "..tostring(e))))
+              if not ok then bad=bad+1 end
+            end
+            if bad>0 then error(bad.." 个 Lua 模块在默认路径下不可加载", 0) end
+            print("  全部可加载")'
+
       - name: Run all unit suites
         # 用总入口而不是逐个列：新加的套件自动纳入，不会因为有人忘了
         # 在 workflow 里补一行而变成"看着绿、其实没跑"。

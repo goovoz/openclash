@@ -38,7 +38,14 @@ uci_load() {
 
 	DATA="$(/sbin/uci ${UCI_CONFIG_DIR:+-c $UCI_CONFIG_DIR} ${LOAD_STATE:+-P /var/state} -S -n export "$PACKAGE" 2>/dev/null)"
 	RET="$?"
-	[ "$RET" != 0 -o -z "$DATA" ] || eval "$DATA"
+	# ⚠️ 原本写 `[ ... -o ... ]`（shellcheck SC2166）：test 的 -o/-a 在 POSIX 里
+	#   是**未定义行为**，操作数含 ! 或括号时会因运算符优先级解析错误。
+	#   拆成 `||` 两个 test 是唯一可移植的写法。
+	if [ "$RET" != 0 ] || [ -z "$DATA" ]; then
+		unset DATA
+		return "$RET"
+	fi
+	eval "$DATA"
 	unset DATA
 
 	${CONFIG_SECTION:+config_cb}
