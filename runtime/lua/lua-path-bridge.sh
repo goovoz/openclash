@@ -367,11 +367,22 @@ do_apply() {
 		if [ ! -e "$(_L "$target")" ]; then
 			skipped=$((skipped + 1)); continue      # 模块还没装
 		fi
-		if [ ! -d "$(_L "$dir")" ]; then
-			skipped=$((skipped + 1)); continue      # 目录不存在，不造
-		fi
+		# ⚠️ 顺序很重要：先确认「Lua 确实会来这个 dir 找」，再决定要不要建它。
+		#   反过来会为 Lua 根本不看的目录乱 mkdir。
 		if ! printf '%s\n' "$searched" | grep -qx -- "$dir"; then
 			skipped=$((skipped + 1)); continue      # Lua 根本不去这里找
+		fi
+		# ⚠️ 原本这里写「dir 不存在就 skip」，与 --check 的判据**不一致**：
+		#   check 只看 target 存在就要求 $dir/$name 的软链到位（并不管 dir 是否
+		#   存在）。于是在干净机器上（/usr/lib/lua/5.1/ 这种目录还没被任何包装过）
+		#   出现死循环：apply 说"跳过 8 条（目录不存在）"，check 说"缺失 8 条，
+		#   需要 --apply" —— CI 卡在这里 rc=1（2026-10-01 实测）。
+		#   修：dir 是 Lua 默认搜索目录（上面已确认在 searched 里），建它无害。
+		if [ ! -d "$(_L "$dir")" ]; then
+			mkdir -p "$(_L "$dir")" 2>/dev/null || {
+				skipped=$((skipped + 1)); continue    # 建不了（权限/只读）才跳过
+			}
+			log "  + 建目录 $dir"
 		fi
 		"$LN" -sfn "$target" "$(_L "$dir/$name")"
 		printf '%s|%s\n' "$dir" "$name" >>"$(_L "$STATE_FILE")"
