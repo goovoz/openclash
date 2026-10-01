@@ -232,6 +232,17 @@ install -m 0755 "$ROOT/runtime/net/fw4"                "$STAGE/usr/sbin/fw4"
 install -m 0755 "$ROOT/runtime/net/prepare-tmp.sh"     "$STAGE/usr/lib/openclash-rt/prepare-tmp.sh"
 install -m 0755 "$ROOT/runtime/net/dnsmasq-adapter.sh" "$STAGE/usr/lib/openclash-rt/dnsmasq-adapter.sh"
 
+# 2d) LuCI HTTP 宿主（P3 自研件）—— 替代 uhttpd
+# ----------------------------------------------------------------------------
+# 这是 docs/02 §5.6 H1–H10 的全部实现：监听 TCP、解析 HTTP、静态文件 + CGI 桥。
+# 它**唯一**读 /etc/config/openclash-rt 拿到 listen/port；与上游 LuCI 入口
+# /www/cgi-bin/luci 配对：宿主把 HTTP 转成 CGI 环境变量 + stdin，CGI 脚本输出
+# 的 "Status: .../Headers/Body" 由宿主反解为 HTTP 响应。
+#
+# shebang 必须是 #!/usr/bin/lua5.1（与 cgi-bin/luci 同原则：依赖 Debian
+# 提供的 lua5.1 包，绕开 update-alternatives 路径以避免 5.3/5.4 抢占）。
+install -m 0755 "$ROOT/runtime/sys/luci-host.lua"      "$STAGE/usr/lib/openclash-rt/luci-host.lua"
+
 # 3) 兼容运行时 —— 保留一份可读副本，便于排障与升级对比
 cp "$ROOT/runtime/procd/rc.common"            "$STAGE/usr/lib/openclash-rt/procd/rc.common"
 cp "$ROOT/runtime/procd/procd.sh"             "$STAGE/usr/lib/openclash-rt/procd/procd.sh"
@@ -420,6 +431,19 @@ for u in openclash-rt-dnsmasq-sync.service openclash-rt-dnsmasq-sync.path; do
 	chmod 0644 "$STAGE/lib/systemd/system/$u"
 done
 
+# 6b) LuCI HTTP 宿主单元（P3 自研件）—— 替代 uhttpd
+# ----------------------------------------------------------------------------
+# 为什么单独成一节：本单元是 openclash-rt **前端**的入口守护进程，对应 docs/02
+# §5.6 H1–H10 的完整职责。它**不**依赖 uhttpd：监听 127.0.0.1:9090，把 HTTP
+# 请求作为 CGI 喂给 /www/cgi-bin/luci（CGI 协议详见 sgi/cgi.lua）。
+#
+# 安全默认（127.0.0.1）写在 unit 内部 --listen=127.0.0.1。要外露必须用户显式
+# 改 /etc/config/openclash-rt 的 main.listen（不建议在公网直接暴露；
+# 上游 105 个端点能跑任意 shell）。
+cp "$ROOT/packaging/debian/openclash-rt-luci-host.service" \
+   "$STAGE/lib/systemd/system/openclash-rt-luci-host.service"
+chmod 0644 "$STAGE/lib/systemd/system/openclash-rt-luci-host.service"
+
 # 7) 初始 UCI 配置（conffile）
 if [ ! -f "$STAGE/etc/config/openclash" ]; then
 	cat >"$STAGE/etc/config/openclash" <<'EOF'
@@ -519,6 +543,57 @@ config interface 'wan'
 	option proto 'dhcp'
 config globals 'globals'
 	option ula_prefix 'auto'
+EOF
+fi
+
+# 7d) /etc/config/uhttpd —— 上游 uci-defaults 的写入目标兜底（P3）
+# ----------------------------------------------------------------------------
+# 这个文件**不**被 openclash-rt 自己的宿主读取（宿主只读 /etc/config/openclash-rt）。
+# 它存在只为让上游 OpenClash 的 uci-defaults 那段 `uci set uhttpd.main.*` 与
+# `uci commit uhttpd` **有对象可写**，否则 `-q` 静默落空 → 上游的
+# max_requests/max_connections/script_timeout 全部丢失（且无任何告警）。
+#
+# 同时：上游 uci-defaults 还会调 /etc/init.d/uhttpd restart，我们用本包提供的
+# 兼容 initscript（etc-init.d-uhttpd）替代，把 restart 路由到 luci-host.service。
+#
+# 段名 = 'main'（具名段），与 dhcp/firewall 同样的"上游 cfgid 稳定性"原因。
+if [ ! -f "$STAGE/etc/config/uhttpd" ]; then
+	cat >"$STAGE/etc/config/uhttpd" <<'EOF'
+config uhttpd 'main'
+	option listen_http '0.0.0.0:0'
+	option listen_https '0.0.0.0:0'
+	option home '/www'
+	option realm 'openclash-rt'
+	option index_page 'cgi-bin/luci'
+	option max_requests '3'
+	option max_connections '100'
+	option script_timeout '3600'
+	option http_keepalive '20'
+	option tcp_keepalive '1'
+EOF
+fi
+
+# 7e) /etc/init.d/uhttpd —— 把上游 restart 命令映射到 luci-host.service（P3）
+# ----------------------------------------------------------------------------
+# 这个文件**不是**真 uhttpd；它是 openclash-rt 的「兼容 initscript」。
+# 上游 uci-defaults 调用 /etc/init.d/uhttpd restart，本包把它路由到
+#   systemctl restart openclash-rt-luci-host.service
+# 这样无需碰上游代码（L1 红线），就能让上游的 restart 真的生效。
+install -m 0755 "$ROOT/packaging/debian/etc-init.d-uhttpd" \
+	"$STAGE/etc/init.d/uhttpd"
+
+# 7f) /etc/config/openclash-rt —— 宿主自己的 UCI 配置（P3）
+# ----------------------------------------------------------------------------
+# LuCI 宿主读这份 main 段（listen/port/script_timeout/max_connections）。
+# 不存在时宿主用 DEFAULTS（127.0.0.1:9090 / 3600 / 100）。
+# 提供这份 conffile 的目的是让用户能**不改 unit 文件**地调整宿主行为。
+if [ ! -f "$STAGE/etc/config/openclash-rt" ]; then
+	cat >"$STAGE/etc/config/openclash-rt" <<'EOF'
+config openclash_rt 'main'
+	option listen '127.0.0.1'
+	option port '9090'
+	option script_timeout '3600'
+	option max_connections '100'
 EOF
 fi
 

@@ -1,0 +1,57 @@
+[Unit]
+# openclash-rt 的 LuCI HTTP 宿主（P3 自研件）
+# -----------------------------------------------------------------------------
+# 这是 L2 兼容运行时的一部分，**不**依赖 uhttpd：监听 127.0.0.1:9090（默认），
+# 把请求作为 CGI 喂给 /www/cgi-bin/luci。上游入口代码零修改。
+# -----------------------------------------------------------------------------
+# 为什么 After=rpcd：上游 /www/cgi-bin/luci 入口 require "luci.dispatcher"，
+# dispatcher 又通过 luci.util.ubus("uci", ...) 走 rpcd。rpcd 没起来
+# 时打开 LuCI 会拿到 "Unable to establish ubus connection"。
+# -----------------------------------------------------------------------------
+# 为什么不让它监听公网：默认 127.0.0.1 是安全默认。开放到 0.0.0.0 必须显式
+# 改 /etc/config/openclash-rt 的 main.listen —— 这是设计选择（见
+# docs/02 §5.6 H10）。
+# -----------------------------------------------------------------------------
+Description=openclash-rt LuCI HTTP host (CGI-bridge)
+Documentation=https://github.com/vernesong/OpenClash
+Documentation=file:///usr/share/doc/openclash-rt/copyright
+After=network-online.target ubusd.service rpcd.service openclash.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# listen/port/script_timeout/max_connections 走 /etc/config/openclash-rt 的 main 段
+# —— 改动后执行 systemctl restart openclash-rt-luci-host 生效。其它硬约束
+# （cgi 入口 / docroot / max-content / config 路径）作为命令行钉死。
+ExecStart=/usr/bin/lua5.1 /usr/lib/openclash-rt/luci-host.lua \
+    --cgi=/www/cgi-bin/luci \
+    --docroot=/www \
+    --config=/etc/config/openclash-rt \
+    --max-content=10485760
+Restart=on-failure
+RestartSec=5
+
+# ---- 安全加固（**保守集**：保留 ProcessRestrictions，禁止文件系统写、禁个人
+# 主页、禁非基本命名空间。**不**用 ProtectSystem=strict，因为我们走 io.popen +
+# os.tmpname()，临时目录必须可写；Strict 下 /tmp 也只读，Lua os.tmpname
+# 会失败导致 226/NAMESPACE。
+# 1) NoNewPrivileges：禁止子进程提权
+# 2) PrivateTmp=true：/tmp 独立但可写
+# 3) ProtectHome=true：/home、/run/user 只读
+# 4) RestrictNamespaces / RestrictRealtime / LockPersonality
+# 5) RestrictAddressFamilies AF_UNIX（ubusd）+ AF_INET（监听）+ AF_INET6
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

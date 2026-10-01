@@ -1,0 +1,41 @@
+# /etc/config/uhttpd —— openclash-rt 安装期兜底模板
+# -----------------------------------------------------------------------------
+# 这个文件**不被 openclash-rt 的 LuCI 宿主读取**。宿主只读 /etc/config/openclash-rt。
+# 这个文件存在的**唯一**目的是：
+#
+#   上游 OpenClash 的 uci-defaults/luci-openclash 会执行：
+#       uci -q set uhttpd.main.max_requests=50
+#       uci -q set uhttpd.main.max_connections=100
+#       uci -q set uhttpd.main.script_timeout=3600
+#       uci -q commit uhttpd
+#       sed -i ... /usr/lib/lua/luci/http.lua   # 放大 HTTP_MAX_CONTENT
+#       /etc/init.d/uhttpd restart
+#
+#   若 /etc/config/uhttpd 不存在，`uci set` 在 `-q` 下静默落空（丢弃写操作），
+#   `commit` 也无对象可写 → 上游的整段意图丢失且无任何提示。Web UI 改配置时
+#   大文件会上传失败（HTTP_MAX_CONTENT 默认 100KB），并且即使 uhttpd 不存在
+#   也没关系 —— 我们的宿主只读 openclash-rt，不读 uhttpd。但 commit 必须把
+#   这些值持久化下来，供人工检查 / 复盘。
+#
+# 段名必须是 'main'（**具名段**），原因同 /etc/config/dhcp.main：上游推导
+#   DEFAULT_UHTTPD_CFGID = "$(uci_get_section_of_type uhttpd uhttpd main)"
+# 走匿名（section），段顺序变了 cfgid 就变了。
+#
+# 这个文件**不**与任何上游 uhttpd 包冲突：openclash-rt **不**依赖 uhttpd，
+# 且此文件只在「系统里既没装 uhttpd 也没装 openclash-rt 兼容宿主」的情况下
+# 显得"冷"。如果用户装回真正的 uhttpd 包，dpkg 会因为这个 conffile 而
+# 询问用户是否覆盖 —— 此时选「保留本包版本」即可（因为宿主根本不用它）。
+# -----------------------------------------------------------------------------
+
+
+config uhttpd 'main'
+	option listen_http '0.0.0.0:0'
+	option listen_https '0.0.0.0:0'
+	option home '/www'
+	option realm 'openclash-rt'
+	option index_page 'cgi-bin/luci'
+	option max_requests '3'
+	option max_connections '100'
+	option script_timeout '3600'
+	option http_keepalive '20'
+	option tcp_keepalive '1'

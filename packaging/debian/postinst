@@ -196,6 +196,22 @@ case "${1:-}" in
 			# 不走 sysv 同步，效果等价于 enable 的 WantedBy=multi-user.target。
 			systemctl add-wants multi-user.target openclash.service >/dev/null 2>&1 || \
 				log "开机自启未挂上，可手动执行： systemctl add-wants multi-user.target openclash.service"
+
+			# LuCI HTTP 宿主（P3 自研件）
+			# -----------------------------------------------------------------------------
+			# 这是 Web UI 的入口守护进程。**也不**能用 `systemctl enable`：
+			# /etc/init.d/uhttpd 与本单元并不同名（宿主单元是
+			# openclash-rt-luci-host.service），但 /etc/init.d/uhttpd 是我们
+			# 提供的兼容 initscript，systemd-sysv-install 会扫到它并尝试
+			# update-rc.d —— openclash 的 initscript 无 LSB Default-Start，
+			# 同样会 abort。
+			# add-wants 同样是唯一安全路径。
+			systemctl add-wants multi-user.target openclash-rt-luci-host.service >/dev/null 2>&1 || \
+				log "开机自启 luci-host 未挂上，可手动执行： systemctl add-wants multi-user.target openclash-rt-luci-host.service"
+			# 立即拉起宿主（如果端口被占就让它失败，systemd 会按 Restart=on-failure 重启）
+			systemctl start openclash-rt-luci-host.service >/dev/null 2>&1 || \
+				log "luci-host 启动失败，可手动执行： systemctl status openclash-rt-luci-host"
+
 			# 监听 /etc/config/dhcp 变化，把 UCI 翻译成 dnsmasq 配置
 			systemctl enable --now openclash-rt-dnsmasq-sync.path >/dev/null 2>&1 || \
 				log "dnsmasq 同步单元未启用（可手动： systemctl enable --now openclash-rt-dnsmasq-sync.path）"

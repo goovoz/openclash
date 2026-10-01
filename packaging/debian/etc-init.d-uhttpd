@@ -1,0 +1,89 @@
+#!/bin/sh
+# /etc/init.d/uhttpd —— openclash-rt 兼容 initscript
+# -----------------------------------------------------------------------------
+# 这个文件**不是**真正的 uhttpd。它存在的唯一理由：
+#
+#   上游 OpenClash 的 uci-defaults/luci-openclash 会执行：
+#       /etc/init.d/uhttpd restart
+#
+#   而我们的 systemd 单元叫 openclash-rt-luci-host.service。
+#   ⇒ 把 /etc/init.d/uhttpd 的命令映射到 systemd，让上游那条 restart 真的生效。
+#
+# 这是「喂上游的探测」范式在 service 控制上的应用：
+# 上游的代码不可改（L1 红线），但它期望的环境我们可以构造。
+#
+# 设计要点：
+# - 必须 startable / stoppable / restartable / enableable（uhttpd 在 OpenWrt 上
+#   也是这些 verb）
+# - 不与真实 uhttpd 包冲突：若用户后续装了真 uhttpd，dpkg 会因为 conffile
+#   询问 —— 此时选择「保留本包版本」就行（见 etc-config-uhttpd 头部说明）
+# - 没有「真正启一个 uhttpd 守护」的逻辑（start 时调用 systemctl start
+#   openclash-rt-luci-host.service，相当于启用宿主）
+# - reload 与 restart 同义 —— 上游 init 脚本可能会调 reload_service
+# -----------------------------------------------------------------------------
+
+NAME=uhttpd
+TARGET=openclash-rt-luci-host.service
+
+case "${1:-}" in
+	start)
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl start "$TARGET" || exit 1
+		else
+			echo "/etc/init.d/$NAME: systemctl not found; cannot start $TARGET" >&2
+			exit 1
+		fi
+		;;
+	stop)
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl stop "$TARGET" || exit 1
+		else
+			echo "/etc/init.d/$NAME: systemctl not found; cannot stop $TARGET" >&2
+			exit 1
+		fi
+		;;
+	restart)
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl restart "$TARGET" || exit 1
+		else
+			echo "/etc/init.d/$NAME: systemctl not found; cannot restart $TARGET" >&2
+			exit 1
+		fi
+		;;
+	reload)
+		# 上游 reload_service 语义：reload firewall/manual/revert/restore
+		# openclash-rt 不实现 reload（reload_service 走 init.d/openclash），
+		# 这里 restart 即可（足够覆盖常见重启场景）。
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl restart "$TARGET" || exit 1
+		else
+			echo "/etc/init.d/$NAME: systemctl not found; cannot reload $TARGET" >&2
+			exit 1
+		fi
+		;;
+	enable)
+		# 由 postinst 走 systemctl add-wants；这里只是空操作
+		: # nothing to do
+		;;
+	disable)
+		: # nothing to do
+		;;
+	enabled)
+		# 上游 boot() 会 check 这个 return：return 0 = 已启用
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl is-enabled "$TARGET" >/dev/null 2>&1 && exit 0 || exit 1
+		fi
+		exit 1
+		;;
+	boot)
+		# openclash 的 init.d/boot 路径会 source /etc/init.d/uhttpd 的
+		# boot 段，但 openclash 的脚本从不调它；这里只 echo。
+		echo "boot: nothing to do (openclash-rt handles /www via unit)"
+		;;
+	*)
+		echo "Usage: /etc/init.d/$NAME {start|stop|restart|reload|enable|disable|enabled|boot}" >&2
+		exit 1
+		;;
+esac
+
+exit 0

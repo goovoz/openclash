@@ -56,6 +56,10 @@ case "${1:-}" in
 			systemctl disable openclash.service >/dev/null 2>&1 || true
 			systemctl disable --now openclash-rt-dnsmasq-sync.path >/dev/null 2>&1 || true
 
+			# LuCI HTTP 宿主（P3 自研件）—— 停 + 清 wants 软链
+			systemctl stop    openclash-rt-luci-host.service >/dev/null 2>&1 || true
+			systemctl disable openclash-rt-luci-host.service >/dev/null 2>&1 || true
+
 			# ubus 底座（ubusd + rpcd）是随本包一起装进来的，卸载时一并撤走，
 			# 否则会留下一个用户不知道来源的常驻总线进程。
 			# 顺序写死为 rpcd 先、ubusd 后：rpcd.service 有 Requires=ubusd.service，

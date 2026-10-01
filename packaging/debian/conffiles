@@ -1,4 +1,9 @@
 /etc/config/openclash
 /etc/config/dhcp
+/etc/config/network
+/etc/config/firewall
+/etc/config/openclash-rt
+/etc/config/uhttpd
 /etc/rc.common
+/etc/init.d/uhttpd
 /etc/openwrt_release
