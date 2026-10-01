@@ -154,7 +154,19 @@ jobs:
         run: |
           set -euo pipefail
           SP="$RUNNER_TEMP/lua-modules"
-          bash runtime/lua/build-lua-modules.sh --destdir "$SP" 2>&1 | tail -12
+          # ⚠️ 必须用 sudo 跑，且同时给 LD_LIBRARY_PATH：
+          #
+          #   luci.ip.so 通过 dlopen 依赖 libnl-tiny.so.1。build-lua-modules.sh
+          #   内部会把 libnl-tiny 装进 **/usr/lib/x86_64-linux-gnu/**（系统路径），
+          #   这一步需要 root —— CI 的 runner 是普通用户，不 sudo 就装不进去，
+          #   于是自检报：
+          #     FAIL luci.ip <- libnl-tiny.so.1: cannot open shared object file
+          #   （Debian 上不踩是因为那里以 root 跑，掩盖了这条权限依赖。）
+          #
+          #   同时传 LD_LIBRARY_PATH 作为第二重保险：sudo 默认 env_reset 会清掉
+          #   它，所以必须写成 `sudo VAR=... cmd` 而不是先 export 再 sudo。
+          sudo LD_LIBRARY_PATH="$SP/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}" \
+            bash runtime/lua/build-lua-modules.sh --destdir "$SP" 2>&1 | tail -12
           sudo cp -a "$SP"/usr/lib/lua/. /usr/lib/lua/
           sudo cp -a "$SP"/usr/lib/x86_64-linux-gnu/. /usr/lib/x86_64-linux-gnu/
           sudo cp -a "$SP"/usr/bin/po2lmo /usr/bin/po2lmo
