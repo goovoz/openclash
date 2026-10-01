@@ -1,0 +1,83 @@
+#!/bin/sh
+# openclash-rt prerm
+set -e
+
+log() { echo "openclash-rt: $*"; }
+
+SBIN_UCI_MARK=/usr/lib/openclash-rt/.sbin-uci-created
+
+# 只有在「标记文件存在」且「/sbin/uci 仍是本包创建的、且指向当初那个目标」这两个
+# 条件**同时**成立时才删除 /sbin/uci。任一条不成立就原样留下 —— 它可能是别的包
+# 的文件，也可能被用户后来手工改指到别处。
+# 标记文件由 postinst 在真正创建链接时写入（见 postinst 里 a/b/c 三种情形的说明）。
+#
+# 为什么清理点选在 prerm 而不是 postrm：prerm 跑在文件被删除**之前**，此时
+# /usr/lib/openclash-rt/ 里还留着标记，凭据可读；等到 postrm 阶段本包文件已经被
+# 移除，拿不到凭据，就只能盲删 —— 而这正是要避免的行为。
+rm_sbin_uci_if_ours() {
+	[ -f "$SBIN_UCI_MARK" ] || return 0
+	[ -L /sbin/uci ] || return 0
+	_want="$(cat "$SBIN_UCI_MARK" 2>/dev/null || true)"
+	[ -n "$_want" ] || return 0
+	[ "$(readlink /sbin/uci 2>/dev/null || true)" = "$_want" ] || return 0
+	rm -f /sbin/uci 2>/dev/null || true
+}
+
+# 还原 dnsmasq 的关键一步：
+# 上游 stop 会调用 revert_dnsmasq / revert_firewall，把 UCI 与防火墙恢复到
+# 接管前的状态。但 Debian 的 dnsmasq 不读 UCI，读的是 /etc/dnsmasq.d/ 里的
+# 翻译产物。若不同步这一步，卸载后 /etc/dnsmasq.d/00-openclash-rt-uci.conf
+# 里残留的 `server=127.0.0.1#7874` + `no-resolv` 会让整机 DNS 彻底不可用。
+restore_dnsmasq() {
+	if [ -x /usr/lib/openclash-rt/dnsmasq-adapter.sh ]; then
+		# 适配器仍存在：按还原后的 UCI 重新生成（此时已无 OpenClash 指令）
+		/usr/lib/openclash-rt/dnsmasq-adapter.sh >/dev/null 2>&1 || \
+			rm -f /etc/dnsmasq.d/00-openclash-rt-uci.conf /etc/dnsmasq.d/00-openclash-rt-uci.conf.prev 2>/dev/null || true
+	else
+		rm -f /etc/dnsmasq.d/00-openclash-rt-uci.conf /etc/dnsmasq.d/00-openclash-rt-uci.conf.prev 2>/dev/null || true
+	fi
+
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl restart dnsmasq >/dev/null 2>&1 || true
+	elif [ -x /etc/init.d/dnsmasq ]; then
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	fi
+}
+
+case "${1:-}" in
+	remove|deconfigure)
+		# 停服务并清理防火墙/DNS 残留（走上游的 revert 路径，避免把宿主
+		# 系统留在「DNS 被劫持、流量被重定向」的状态）
+		if [ -x /etc/init.d/openclash ]; then
+			/etc/init.d/openclash stop >/dev/null 2>&1 || true
+		fi
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl stop openclash.service >/dev/null 2>&1 || true
+			systemctl disable openclash.service >/dev/null 2>&1 || true
+			systemctl disable --now openclash-rt-dnsmasq-sync.path >/dev/null 2>&1 || true
+
+			# ubus 底座（ubusd + rpcd）是随本包一起装进来的，卸载时一并撤走，
+			# 否则会留下一个用户不知道来源的常驻总线进程。
+			# 顺序写死为 rpcd 先、ubusd 后：rpcd.service 有 Requires=ubusd.service，
+			# systemd 本来就会按依赖倒序停，这里显式写出来只是为了让意图可读。
+			# ⚠️ 若将来有别的包也依赖 ubusd，这里必须改成引用计数式判断
+			#    （dpkg-query -W -f='${Status}' 或 systemctl is-enabled 交叉检查），
+			#    否则会把别人的总线一起拆掉。眼下 ubusd 只属于本包。
+			systemctl disable --now rpcd.service  >/dev/null 2>&1 || true
+			systemctl disable --now ubusd.service >/dev/null 2>&1 || true
+		fi
+		# 只删除确实由本包创建的 /sbin/uci（凭据见上面的函数注释）
+		rm_sbin_uci_if_ours
+		restore_dnsmasq
+		log "已还原 dnsmasq 与防火墙状态"
+		;;
+
+	upgrade|failed-upgrade)
+		# 升级时保留运行状态，由 postinst 处理
+		;;
+
+	*)
+		;;
+esac
+
+exit 0

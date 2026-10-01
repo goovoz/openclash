@@ -1,0 +1,392 @@
+/*
+ * Copyright (C) 2011-2014 Felix Fietkau <nbd@openwrt.org>
+ *
+ * SPDX-License-Identifier: LGPL-2.1-only
+ */
+
+#define _GNU_SOURCE
+
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifdef FreeBSD
+#include <sys/param.h>
+#endif
+#include <fcntl.h>
+#include <string.h>
+#include <syslog.h>
+
+#include <libubox/usock.h>
+
+#include "ubusd.h"
+
+static void ubus_client_cmd_free(struct ubus_client_cmd *cmd);
+
+static void handle_client_disconnect(struct ubus_client *cl)
+{
+	struct ubus_msg_buf_list *ubl, *ubl2;
+	struct ubus_client_cmd *cmd, *cmd2;
+
+	list_for_each_entry_safe(cmd, cmd2, &cl->cmd_queue, list)
+		ubus_client_cmd_free(cmd);
+
+	ubusd_monitor_disconnect(cl);
+	ubusd_proto_free_client(cl);
+
+	/*
+	 * Freeing the client's objects above can queue new messages for the
+	 * disconnecting client itself (e.g. the subscribers-gone notification
+	 * sent by ubus_unsubscribe), so the tx queue must be flushed last.
+	 */
+	list_for_each_entry_safe(ubl, ubl2, &cl->tx_queue, list)
+		ubus_msg_list_free(ubl);
+	if (cl->pending_msg_fd >= 0)
+		close(cl->pending_msg_fd);
+	if (cl->pending_msg)
+		ubus_msg_free(cl->pending_msg);
+	uloop_fd_delete(&cl->sock);
+	close(cl->sock.fd);
+	free(cl);
+}
+
+static void ubus_client_cmd_free(struct ubus_client_cmd *cmd)
+{
+	list_del(&cmd->list);
+	ubus_msg_free(cmd->msg);
+	free(cmd->lookup_path);
+	free(cmd);
+}
+
+static void ubus_client_cmd_queue_process(struct ubus_client *cl)
+{
+	struct ubus_client_cmd *cmd, *tmp;
+
+	list_for_each_entry_safe(cmd, tmp, &cl->cmd_queue, list) {
+		int ret = ubusd_cmd_lookup(cl, cmd);
+
+		/* Stop if the last command caused buffering again */
+		if (ret == -2)
+			break;
+
+		ubus_client_cmd_free(cmd);
+	}
+}
+
+static int ubusd_recv_fd(struct msghdr *msghdr)
+{
+	struct cmsghdr *cmsg;
+
+	for (cmsg = CMSG_FIRSTHDR(msghdr); cmsg; cmsg = CMSG_NXTHDR(msghdr, cmsg)) {
+		if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+			continue;
+		if (cmsg->cmsg_len < CMSG_LEN(sizeof(int)))
+			continue;
+
+		return *(int *) CMSG_DATA(cmsg);
+	}
+
+	return -1;
+}
+
+static void client_cb(struct uloop_fd *sock, unsigned int events)
+{
+	struct ubus_client *cl = container_of(sock, struct ubus_client, sock);
+	uint8_t fd_buf[CMSG_SPACE(sizeof(int))] = { 0 };
+	struct msghdr msghdr = { 0 };
+	struct ubus_msg_buf *ub;
+	struct ubus_msg_buf_list *ubl, *ubl2;
+	static struct iovec iov;
+
+	msghdr.msg_iov = &iov;
+	msghdr.msg_iovlen = 1;
+
+	/* first try to tx more pending data */
+	list_for_each_entry_safe(ubl, ubl2, &cl->tx_queue, list) {
+		ssize_t written;
+
+		ub = ubl->msg;
+retry_writev:
+		written = ubus_msg_writev(sock->fd, ub, cl->txq_ofs);
+		if (written < 0) {
+			switch(errno) {
+			case EINTR:
+				goto retry_writev;
+			case EAGAIN:
+			case EACCES:
+				break;
+			default:
+				goto disconnect;
+			}
+			break;
+		}
+
+		cl->txq_ofs += written;
+		cl->txq_len -= written;
+		if (cl->txq_ofs < ub->len + sizeof(ub->hdr))
+			goto retry_writev;
+
+		cl->txq_ofs = 0;
+		ubus_msg_list_free(ubl);
+	}
+
+	if (list_empty(&cl->tx_queue) && (events & ULOOP_WRITE)) {
+		/* Process queued commands */
+		ubus_client_cmd_queue_process(cl);
+
+		/* prevent further ULOOP_WRITE events if we don't have data
+		 * to send anymore */
+		if (list_empty(&cl->tx_queue))
+			uloop_fd_add(sock, ULOOP_READ | ULOOP_EDGE_TRIGGER);
+	}
+
+retry:
+	if (!sock->eof && cl->pending_msg_offset < (int) sizeof(cl->hdrbuf)) {
+		int offset = cl->pending_msg_offset;
+		int bytes;
+
+		iov.iov_base = ((char *) &cl->hdrbuf) + offset;
+		iov.iov_len = sizeof(cl->hdrbuf) - offset;
+
+		msghdr.msg_control = fd_buf;
+		msghdr.msg_controllen = cl->pending_msg_fd < 0 ? sizeof(fd_buf) : 0;
+
+		bytes = recvmsg(sock->fd, &msghdr, 0);
+		if (bytes < 0)
+			goto out;
+
+		if (cl->pending_msg_fd < 0) {
+			int fd = ubusd_recv_fd(&msghdr);
+
+			if (fd >= 0)
+				cl->pending_msg_fd = fd;
+		}
+
+		cl->pending_msg_offset += bytes;
+		if (cl->pending_msg_offset < (int) sizeof(cl->hdrbuf))
+			goto out;
+
+		if (blob_raw_len(&cl->hdrbuf.data) < sizeof(struct blob_attr))
+			goto disconnect;
+		if (blob_pad_len(&cl->hdrbuf.data) > UBUS_MAX_MSGLEN)
+			goto disconnect;
+
+		cl->pending_msg = ubus_msg_new(NULL, blob_raw_len(&cl->hdrbuf.data), false);
+		if (!cl->pending_msg)
+			goto disconnect;
+
+		cl->hdrbuf.hdr.seq = be16_to_cpu(cl->hdrbuf.hdr.seq);
+		cl->hdrbuf.hdr.peer = be32_to_cpu(cl->hdrbuf.hdr.peer);
+
+		memcpy(&cl->pending_msg->hdr, &cl->hdrbuf.hdr, sizeof(cl->hdrbuf.hdr));
+		memcpy(cl->pending_msg->data, &cl->hdrbuf.data, sizeof(cl->hdrbuf.data));
+	}
+
+	ub = cl->pending_msg;
+	if (ub) {
+		/*
+		 * offset and len derive from client-controlled input, but the
+		 * read stays within bounds: ub->data was allocated with exactly
+		 * blob_raw_len(ub->data) bytes (already capped at UBUS_MAX_MSGLEN
+		 * when the header was received), and offset only grows until it
+		 * reaches that total, at which point the message is accepted and
+		 * pending_msg is reset below. So offset <= blob_raw_len(ub->data)
+		 * and offset + len never exceed the allocation.
+		 */
+		int offset = cl->pending_msg_offset - sizeof(ub->hdr);
+		int len = blob_raw_len(ub->data) - offset;
+		int bytes = 0;
+
+		if (len > 0) {
+			bytes = read(sock->fd, (char *) ub->data + offset, len);
+			if (bytes <= 0)
+				goto out;
+		}
+
+		if (bytes < len) {
+			cl->pending_msg_offset += bytes;
+			goto out;
+		}
+
+		/* accept message */
+		ub->fd = cl->pending_msg_fd;
+		cl->pending_msg_fd = -1;
+		cl->pending_msg_offset = 0;
+		cl->pending_msg = NULL;
+		ubusd_monitor_message(cl, ub, false);
+		ubusd_proto_receive_message(cl, ub);
+		goto retry;
+	}
+
+out:
+	if (!sock->eof || !list_empty(&cl->tx_queue))
+		return;
+
+disconnect:
+	handle_client_disconnect(cl);
+}
+
+static bool get_next_connection(int fd)
+{
+	struct ubus_client *cl;
+	int client_fd;
+
+	client_fd = accept(fd, NULL, 0);
+	if (client_fd < 0) {
+		switch (errno) {
+		case ECONNABORTED:
+		case EINTR:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	cl = ubusd_proto_new_client(client_fd, client_cb);
+	if (cl)
+		uloop_fd_add(&cl->sock, ULOOP_READ | ULOOP_EDGE_TRIGGER);
+	else
+		close(client_fd);
+
+	return true;
+}
+
+static void server_cb(struct uloop_fd *fd, unsigned int events)
+{
+	bool next;
+
+	do {
+		next = get_next_connection(fd->fd);
+	} while (next);
+}
+
+static struct uloop_fd server_fd = {
+	.cb = server_cb,
+};
+
+static int usage(const char *progname)
+{
+	fprintf(stderr, "Usage: %s [<options>]\n"
+		"Options: \n"
+		"  -A <path>:		Set the path to ACL files\n"
+		"  -s <socket>:		Set the unix domain socket to listen on\n"
+		"\n", progname);
+	return 1;
+}
+
+static int sighup_pipe[2] = { -1, -1 };
+
+static void sighup_handler(int sig)
+{
+	int saved_errno = errno;
+	char c = 0;
+	ssize_t r = write(sighup_pipe[1], &c, sizeof(c));
+	(void)r;
+	errno = saved_errno;
+}
+
+static void sighup_fd_cb(struct uloop_fd *ufd, unsigned int events)
+{
+	char buf[16];
+	while (read(ufd->fd, buf, sizeof(buf)) > 0)
+		;
+	ubusd_acl_load();
+}
+
+static struct uloop_fd sighup_ufd = {
+	.cb = sighup_fd_cb,
+};
+
+/*
+ * Best effort only: the -s option may point somewhere else entirely, and
+ * usock() reports a clear error if the requested socket path is unusable.
+ */
+static void mkdir_sockdir(void)
+{
+	char *ubus_sock_dir, *tmp;
+
+	ubus_sock_dir = strdup(UBUS_UNIX_SOCKET);
+	if (!ubus_sock_dir)
+		return;
+
+	tmp = strrchr(ubus_sock_dir, '/');
+	if (tmp) {
+		*tmp = '\0';
+		if (mkdir(ubus_sock_dir, 0755) && errno == EEXIST) {
+			struct stat st;
+
+			if (stat(ubus_sock_dir, &st) || !S_ISDIR(st.st_mode))
+				fprintf(stderr, "%s exists but is not a directory\n",
+					ubus_sock_dir);
+		}
+	}
+
+	free(ubus_sock_dir);
+}
+
+#include <libubox/ulog.h>
+
+int main(int argc, char **argv)
+{
+	const char *ubus_socket = UBUS_UNIX_SOCKET;
+	int ret = 0;
+	int ch;
+
+	signal(SIGPIPE, SIG_IGN);
+
+#ifdef __linux__
+	ret = pipe2(sighup_pipe, O_NONBLOCK | O_CLOEXEC);
+#else
+	ret = pipe(sighup_pipe);
+	if (ret == 0) {
+		fcntl(sighup_pipe[0], F_SETFL, O_NONBLOCK);
+		fcntl(sighup_pipe[0], F_SETFD, FD_CLOEXEC);
+		fcntl(sighup_pipe[1], F_SETFL, O_NONBLOCK);
+		fcntl(sighup_pipe[1], F_SETFD, FD_CLOEXEC);
+	}
+#endif
+	if (ret == 0)
+		signal(SIGHUP, sighup_handler);
+	else
+		signal(SIGHUP, SIG_IGN);
+
+	ulog_open(ULOG_KMSG | ULOG_SYSLOG, LOG_DAEMON, "ubusd");
+	openlog("ubusd", LOG_PID, LOG_DAEMON);
+	uloop_init();
+
+	if (sighup_pipe[0] >= 0) {
+		sighup_ufd.fd = sighup_pipe[0];
+		uloop_fd_add(&sighup_ufd, ULOOP_READ);
+	}
+
+	while ((ch = getopt(argc, argv, "A:s:")) != -1) {
+		switch (ch) {
+		case 's':
+			ubus_socket = optarg;
+			break;
+		case 'A':
+			ubusd_acl_dir = optarg;
+			break;
+		default:
+			return usage(argv[0]);
+		}
+	}
+
+	mkdir_sockdir();
+	unlink(ubus_socket);
+	umask(0111);
+	server_fd.fd = usock(USOCK_UNIX | USOCK_SERVER | USOCK_NONBLOCK, ubus_socket, NULL);
+	if (server_fd.fd < 0) {
+		perror("usock");
+		ret = -1;
+		goto out;
+	}
+	uloop_fd_add(&server_fd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
+	ubusd_acl_load();
+
+	uloop_run();
+	unlink(ubus_socket);
+
+out:
+	uloop_done();
+	return ret;
+}

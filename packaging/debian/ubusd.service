@@ -1,0 +1,28 @@
+[Unit]
+# 本单元**逐字取自上游**：vendor/ubus/debian/ubus.ubusd.service
+# （openwrt/project/ubus 自带 Debian 打包，作者已经为它想清楚了依赖顺序）。
+# 改动它之前先想清楚：DefaultDependencies=no + Before=basic.target 是刻意的，
+# ubusd 要求极早启动 —— 否则 rpcd 与任何 ubus 客户端在开机早期会连不上。
+Description=OpenWrt micro bus daemon (openclash-rt)
+Documentation=https://git.openwrt.org/project/ubus.git
+Documentation=https://github.com/vernesong/OpenClash
+DefaultDependencies=no
+Before=basic.target
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ubusd
+Restart=always
+RestartSec=5
+# RuntimeDirectory=ubus → systemd 创建 /run/ubus。
+# 这正是 ubusd 编译期写死的 socket 目录：
+#   UBus 的 CMakeLists 里 SET(UBUS_UNIX_SOCKET "/var/run/ubus/ubus.sock")
+#   而 /var/run 是指向 /run 的软链。
+# 少了它，ubusd 会自己 mkdir（ubusd_main.c:307 有兜底），但如果权限不对，
+# 症状是 socket 建不出来、所有客户端报 connect failed。
+RuntimeDirectory=ubus
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=sysinit.target

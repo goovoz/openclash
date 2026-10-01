@@ -1,0 +1,355 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint runtime and scripts
+        run: |
+          set -o pipefail
+          shellcheck -s sh -e SC1090,SC1091,SC2034,SC3043 \
+            runtime/procd/rc.common \
+            runtime/procd/procd.sh \
+            runtime/shell/service.sh \
+            runtime/shell/config/uci.sh \
+            packaging/debian/postinst \
+            packaging/debian/prerm \
+            packaging/debian/postrm
+          shellcheck -s bash \
+            scripts/sync-upstream.sh \
+            scripts/fetch-luci-vendor.sh \
+            scripts/build-deb.sh \
+            runtime/uci/build-uci.sh \
+            runtime/net/fw4 \
+            runtime/net/prepare-tmp.sh \
+            runtime/net/dnsmasq-adapter.sh \
+            runtime/sys/openwrt-release.sh \
+            runtime/lua/build-lua-modules.sh \
+            runtime/lua/lua-path-bridge.sh \
+            runtime/lua/lib/upstream-parsers.sh \
+            runtime/lib/build-common.sh \
+            runtime/ubus/build-ubus.sh \
+            runtime/upstream/pin-lua-interpreter.sh \
+            scripts/install-vendor-luci.sh \
+            scripts/install-vendor-lmo.sh \
+            tests/run-all.sh \
+            tests/test_procd_shim.sh \
+            tests/test_upstream_load.sh \
+            tests/test_fw4_shim.sh \
+            tests/test_dns_prep.sh \
+            tests/test_openwrt_release.sh \
+            tests/test_lua_parsers.sh \
+            tests/test_lua_path_bridge.sh \
+            tests/test_pin_lua.sh \
+            tests/test_maintainer_scripts.sh \
+            tests/test_luci_vendor_install.sh \
+            tests/test_luci_lmo_install.sh \
+            tests/e2e/linux/run-e2e.sh
+          shellcheck -s sh tests/mock/bin/systemctl
+          shellcheck -s bash tests/mock/bin/uci tests/mock/bin/nft
+
+  test:
+    name: Unit & load tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test deps
+        # lua5.1 是 lua-path-bridge.sh 的探测对象：它要问解释器"你的默认
+        # 搜索路径是什么"，没有解释器就只能退化到 --apply 的兜底分支，
+        # C1/C2/C3 那组断言就失去意义了。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.1
+      - name: Sync upstream (needed by load test)
+        run: bash scripts/sync-upstream.sh
+      - name: Ensure LuCI vendor tree
+        # vendor/ 若已提交则跳过（脚本内部用 diff 判等，本步是幂等的）；
+        # 未提交时现场拉取。两种情形 CI 都应能跑通。
+        run: bash scripts/fetch-luci-vendor.sh
+      - name: Run all unit suites
+        # 用总入口而不是逐个列：新加的套件自动纳入，不会因为有人忘了
+        # 在 workflow 里补一行而变成"看着绿、其实没跑"。
+        run: bash tests/run-all.sh --timeout 600
+      - name: Linux end-to-end (real paths, real dash, real nftables in netns)
+        run: sudo bash tests/e2e/linux/run-e2e.sh
+
+  build-deb:
+    name: Build .deb
+    runs-on: ubuntu-24.04
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git \
+            libjson-c-dev lua5.1 liblua5.1-0-dev \
+            dpkg-dev fakeroot
+      - name: Sync upstream
+        run: bash scripts/sync-upstream.sh
+      - name: Ensure LuCI vendor tree
+        run: bash scripts/fetch-luci-vendor.sh
+      - name: Build
+        run: bash scripts/build-deb.sh
+      - name: Verify Lua C modules actually load (authoritative)
+        # ★ 这是 P1 唯一的权威判据。
+        #
+        # 为什么不能只断言"文件存在"：
+        #   一个 .so 存在、能 nm 出符号、甚至 build-lua-modules.sh --verify
+        #   （带着我们指定的 LUA_CPATH）能加载 —— 都不等于**装到系统上之后**
+        #   默认搜索路径能找到它。而 lua-path-bridge.sh 存在的全部意义，就是
+        #   让 Debian lua5.1 的**编译期默认** cpath/path 命中 /usr/lib/lua。
+        #   所以这里必须：真的 dpkg -i → 不带任何 LUA_CPATH/LUA_PATH 地
+        #   `lua5.1 -e 'require(...)'` → 卸载。任何一步绕过，测的就不是它。
+        #
+        # 另外顺带覆盖一个容易静默失效的点：luci.ip 的 DT_NEEDED 里写着
+        # libnl-tiny.so.1，它落在 /usr/lib/<multiarch>/，必须由 postinst 的
+        # ldconfig 登记进缓存。漏了这一步，报错会是
+        #   libnl-tiny.so.1: cannot open shared object file
+        # 而不是"软链没建对"，很容易查错方向。
+        run: |
+          set -euo pipefail
+          DEB="$(ls dist/openclash-rt_*.deb | head -1)"
+          echo "── 包内 Lua 产物 ──"
+          dpkg-deb -c "$DEB" | grep -E 'lua/|po2lmo' | sed 's/^/  /'
+
+          echo "── 软链必须指向 /usr/lib/lua（不是 staging 路径） ──"
+          dpkg-deb -c "$DEB" | grep -E '\-> /usr/lib/lua' | sed 's/^/  /'
+          n="$(dpkg-deb -c "$DEB" | grep -cE '\-> /usr/lib/lua')"
+          [ "$n" -ge 5 ] || { echo "::error::包内指向 /usr/lib/lua 的软链只有 $n 条，期望 >= 5"; exit 1; }
+          if dpkg-deb -c "$DEB" | grep -E '\-> .*(build|stage|tmp)' ; then
+            echo "::error::软链目标里带构建期路径，装到 / 之后是死链"; exit 1
+          fi
+
+          sudo dpkg -i "$DEB"
+          echo "── 用默认搜索路径实测 require（不加 LUA_CPATH / LUA_PATH） ──"
+          sudo env -u LUA_CPATH -u LUA_PATH lua5.1 -e '
+          local mods = {
+            -- ★ ubus 是**加载期**硬依赖，不是功能依赖：
+            --   vendor/luci/luci-lib-base/luasrc/util.lua:15 是顶层
+            --   local _ubus = require "ubus"，而 luci.util 被几乎所有
+            --   LuCI 模块 require。它加载不了 = 前端一行都跑不起来，
+            --   上游 8 个 #!/usr/bin/lua 脚本同样全军覆没。
+            "ubus",
+            "nixio", "nixio.fs", "nixio.util",
+            "lucihttp",
+            "luci.ip", "luci.jsonc", "luci.template.parser",
+          }
+          local ng = 0
+          for _, m in ipairs(mods) do
+            local ok, err = pcall(require, m)
+            print((ok and "OK   " or "FAIL ") .. m .. (ok and "" or ("  <- " .. tostring(err))))
+            if not ok then ng = ng + 1 end
+          end
+          os.exit(ng == 0 and 0 or 1)'
+
+          echo "── 上游 11 处 lua 依赖必须已钉到 /usr/bin/lua5.1 ──"
+          # 为什么必须验"装完之后"：上游 11 处假定 `lua` 命令是 5.1，而 Debian
+          # 的 /usr/bin/lua 由 update-alternatives 组 lua-interpreter 提供，
+          # 优先级 lua5.1=110 < lua5.2/5.3=120 < lua5.4=130。机器上只要有
+          # lua5.4，/usr/bin/lua 就指向 5.4，为 5.1 编译的 .so 会在运行时以
+          # undefined symbol 失败 —— 症状与「搜索路径没桥接对」几乎一样。
+          # 打包期已改写；这里确认它真的落到了系统的 /usr/share/openclash。
+          # 宽判据与 runtime/upstream/pin-lua-interpreter.sh 的 RESIDUAL_RE 同源。
+          LUA_GATE='^#![[:space:]]*.*lua[[:space:]]*$|(^|[^[:alnum:]_./-])lua([^[:alnum:]_.-]|$)'
+          n_sb="$(grep -rlE '^#!/usr/bin/lua5\.1$' /usr/share/openclash 2>/dev/null | wc -l)"
+          [ "$n_sb" -eq 8 ] || { echo "::error::shebang 指向 lua5.1 的文件数为 $n_sb，期望 8"; exit 1; }
+          n_calls="$(grep -rhoE '/usr/bin/lua5\.1 /usr/share/openclash/' /usr/share/openclash 2>/dev/null | wc -l)"
+          [ "$n_calls" -eq 3 ] || { echo "::error::显式调用改写的处数为 $n_calls，期望 3"; exit 1; }
+          n_left="$(grep -rlE "$LUA_GATE" /usr/share/openclash 2>/dev/null | wc -l)"
+          [ "$n_left" -eq 0 ] || {
+            echo "::error::仍有 $n_left 个文件存在裸 lua 依赖："
+            grep -rnE "$LUA_GATE" /usr/share/openclash | head -10
+            exit 1; }
+          command -v lua5.1 >/dev/null || { echo "::error::lua5.1 不在 PATH 上"; exit 1; }
+          v="$(lua5.1 -e 'io.write(_VERSION)')"
+          [ "$v" = "Lua 5.1" ] || { echo "::error::lua5.1 自报版本为 $v"; exit 1; }
+          test -f /usr/lib/openclash-rt/packaging-adaptations.txt \
+            || { echo "::error::packaging-adaptations.txt 未随包发布（上游同步时失去对照表）"; exit 1; }
+          echo "11 处已钉定，lua5.1 = $v"
+
+          echo "── ubus.so 必须在 Debian 默认 cpath 命中的目录里 ──"
+          # 只说"包里有 ubus.so"是不够的：ubus/lua/CMakeLists.txt:3 有
+          #   SET(CMAKE_INSTALL_PREFIX /)
+          # 它把 Lua 绑定强行装到 /lib/lua/5.1（**不在** $PREFIX/usr 下），
+          # 而 Debian lua5.1 的默认 cpath 命中 /usr/lib/lua/5.1/。两者差一层
+          # 目录，build-ubus.sh 必须显式把它搬到 usr/lib/lua/5.1 —— 搬漏了，
+          # require "ubus" 会报 module not found，且只在装完之后才暴露。
+          test -f /usr/lib/lua/5.1/ubus.so || {
+            echo "::error::/usr/lib/lua/5.1/ubus.so 不存在（staging 时没从 /lib/lua/5.1 搬过来？）"; exit 1; }
+
+          echo "── libubus.so.1 必须已被 ldconfig 登记 ──"
+          # libubus 按上游惯例装在 /usr/lib（不是 /usr/lib/<multiarch>/），
+          # 而 /usr/lib 不在 Debian 默认的 ld.so.conf.d/<triple>.conf 里。
+          # postinst 写 /etc/ld.so.conf.d/openclash-rt.conf 并跑 ldconfig 就是
+          # 为它和 libuci 准备的；实测发现漏掉的症状是 rpcd 启动即报
+          #   libubus.so.1: cannot open shared object file
+          # 而不是"服务没配好"，很容易查错方向。
+          # 注意：这里不能写 `ldconfig -p | grep -q ...` —— grep -q 一旦匹配就
+          # 提前退出，上游 ldconfig 收到 SIGPIPE，配合 set -o pipefail 会让
+          # 这条**本该成功**的断言返回非零。改用全量读取的 grep。
+          sudo ldconfig -p | grep 'libubus\.so\.1' | sed 's/^/  /' || true
+          sudo ldconfig -p | grep 'libubus\.so\.1' >/dev/null || {
+            echo "::error::ldconfig 缓存里没有 libubus.so.1 —— postinst 的 ldconfig 没生效"; exit 1; }
+
+          echo "── ubusd / rpcd / ubus 三个可执行文件必须就位 ──"
+          for x in /usr/sbin/ubusd /usr/sbin/rpcd /usr/bin/ubus; do
+            test -x "$x" || { echo "::error::$x 缺失或不可执行"; exit 1; }
+          done
+
+          echo "── /sbin/uci 必须落位，且不得是自指链接 ──"
+          # 上游 uci_load 硬编码 /sbin/uci，而 Debian 上 uci 装在 /usr/sbin 或 /usr/bin。
+          # 分两种主机：
+          #   · usrmerge（Debian 12+ / Ubuntu 24.04，CI 就是）：/sbin 本身就是
+          #     -> usr/sbin，两个路径是同一个文件 —— postinst 在这里**什么都不做**，
+          #     因为 `ln -sf /usr/sbin/uci /sbin/uci` 会造出指向自己的链接，GNU ln
+          #     以 "are the same file" 报错并非零退出，set -e 下会让 postinst 失败。
+          #   · 非 usrmerge：postinst 补一个软链，并写所有权标记供卸载端判断。
+          # 无论哪种，先验"结果"：可解析、可执行、且解析收敛（自环会让 readlink -f
+          # 返回空 —— 这比解析 ls -l 输出可靠）。
+          test -x /sbin/uci || { echo "::error::/sbin/uci 缺失或不可执行"; exit 1; }
+          test -n "$(readlink -f /sbin/uci 2>/dev/null)" \
+            || { echo "::error::/sbin/uci 解析不收敛（自指链接？）"; exit 1; }
+          MARK=/usr/lib/openclash-rt/.sbin-uci-created
+          if [ /sbin -ef /usr/sbin ]; then
+            echo "  本机为 usrmerge，/sbin/uci 由 /usr/sbin 直接提供"
+            test ! -e "$MARK" || {
+              echo "::error::usrmerge 主机上 postinst 不应写所有权标记，但它存在：$MARK"; exit 1; }
+          else
+            echo "  非 usrmerge，/sbin/uci -> $(readlink /sbin/uci 2>/dev/null)"
+            test -f "$MARK" || {
+              echo "::error::postinst 创建了 /sbin/uci 却未写所有权标记 —— 卸载时会漏删"; exit 1; }
+          fi
+          echo "  /sbin/uci 落位正常"
+
+          echo "── ubusd.service + rpcd.service 必须真的能起来 ──"
+          # 刻意走 systemd 而不是直接起进程：两个单元里的 RuntimeDirectory=
+          # 才是 /run/ubus 与 /run/rpcd 的创建者，绕过 systemd 起会得到一个
+          # "连不上总线"的**假**失败。
+          sudo systemctl daemon-reload
+          sudo systemctl start ubusd.service rpcd.service
+          for s in ubusd rpcd; do
+            sudo systemctl is-active --quiet "$s.service" || {
+              echo "::error::$s.service 没起来"
+              sudo journalctl -u "$s.service" --no-pager | tail -30
+              exit 1; }
+          done
+
+          # ubusd 的 socket 出现与 systemd 报告 active 之间有极小的时间差，
+          # 用一个有界的等待代替固定 sleep（固定 sleep 要么白等要么偶发失败）。
+          for _ in $(seq 1 20); do sudo ubus list >/dev/null 2>&1 && break; sleep 0.5; done
+
+          echo "── ubus 对象清单（session / uci 必须都在） ──"
+          sudo ubus list | sed 's/^/  /'
+          # 这两个对象**不是**插件，它们编在 rpcd 主程序里
+          # （vendor/rpcd/main.c:117-119 无条件调用 *_api_init），所以关掉
+          # FILE/IWINFO/RPCSYS/UCODE 四个 *_SUPPORT 不会影响它们。
+          for o in session uci; do
+            sudo ubus list "$o" >/dev/null 2>&1 || {
+              echo "::error::ubus 上没有『$o』对象"; exit 1; }
+          done
+
+          echo "── 用 ubus 真读一份 UCI 配置（route B 的核心通路） ──"
+          # 这是 route B 最该被机器守住的一条：luci.model.uci 的 call() 是
+          #   util.ubus("uci", cmd, args)        (model/uci.lua:41)
+          # 而 CLI 脚本不带 ubus_rpc_session。vendor/rpcd/uci.c:315 正好是
+          #   if (!sid) return true;             ← 无 session 直接短路放行 ACL
+          # 所以下面的调用**必须**成功。它失败就意味着 rpcd 选错了
+          # INSTALL_PREFIX —— ACL 去找 /share/rpcd/acl.d 而不是
+          # /usr/share/rpcd/acl.d —— 而那类"文件装对了、程序去别处找"的错
+          # 最难查（症状是"uci get 没权限"，文件却好好躺在正确位置）。
+          # 同样不用 `| head -N` 截断：head 提前退出会给 ubus 送 SIGPIPE。
+          uci_out="$(sudo ubus call uci get '{"config":"openclash"}' 2>&1)" || {
+            echo "::error::ubus call uci get 失败：$uci_out"; exit 1; }
+          printf '%s\n' "$uci_out" | sed -n '1,8p' | sed 's/^/  /'
+
+          echo "── vendor LuCI 布局必须就位（P2-A，docs/03 §3.1） ──"
+          # 前端三件套：库（luci/ 前缀）、静态资源（三个包的 htdocs 合并）、
+          # 两个入口（shebang 已钉）。任何一条缺失都是静默型失败：
+          #   · 缺 luci/ 前缀 → require 全数失败，症状像"模块没装"
+          #   · 缺 theme 的 htdocs → 界面裸奔（无 CSS），但功能"正常"
+          #   · 入口 shebang 未钉 → 装有 lua5.4 的机器上随机崩
+          for f in \
+            /usr/lib/lua/luci/dispatcher.lua \
+            /usr/lib/lua/luci/util.lua \
+            /usr/lib/lua/luci/cbi.lua \
+            /usr/lib/lua/luci/view/themes/bootstrap/header.htm \
+            /www/luci-static/bootstrap/cascade.css \
+            /www/luci-static/resources/cbi/add.gif \
+            /www/cgi-bin/luci \
+            /usr/libexec/rpcd/luci \
+            /usr/share/rpcd/acl.d/luci-base.json \
+            /usr/share/luci/menu.d/luci-base.json \
+            /etc/config/luci \
+            /etc/init.d/ucitrack \
+            /etc/luci-uploads/.placeholder \
+            /usr/sbin/luci-reload; do
+            test -f "$f" || { echo "::error::vendor LuCI 缺 $f"; exit 1; }
+          done
+          [ "$(head -1 /www/cgi-bin/luci)" = "#!/usr/bin/lua5.1" ] \
+            || { echo "::error::/www/cgi-bin/luci 的 shebang 未钉：$(head -1 /www/cgi-bin/luci)"; exit 1; }
+          [ "$(head -1 /usr/libexec/rpcd/luci)" = "#!/usr/bin/lua5.1" ] \
+            || { echo "::error::/usr/libexec/rpcd/luci 的 shebang 未钉"; exit 1; }
+          # .luadoc 是上游 API 文档，装进包是纯噪声（179→172 的那次清理）
+          n_doc="$(find /usr/lib/lua/luci -name '*.luadoc' 2>/dev/null | wc -l)"
+          [ "$n_doc" -eq 0 ] || { echo "::error::$n_doc 个 .luadoc 误入包"; exit 1; }
+          echo "vendor LuCI 布局 14 项全数就位"
+
+          echo "── po2lmo 是构建期工具（P2 生成 .lmo 要用），也应可用 ──"
+          # 带一个合法的头条目：lmo 头里要存复数形式数量，从 `msgid ""` 那条读。
+          # 省掉它虽然多数情况下也能编过，但会让断言测不到真实调用形态。
+          printf '%s\n' \
+            'msgid ""' \
+            'msgstr "Content-Type: text/plain; charset=UTF-8\n"' \
+            '' \
+            'msgid "Hello"' \
+            'msgstr "你好"' > /tmp/t.po
+          po2lmo /tmp/t.po /tmp/t.lmo
+          [ -s /tmp/t.lmo ] || { echo "::error::po2lmo 产出了空 .lmo"; exit 1; }
+          echo "po2lmo OK，产物 $(stat -c %s /tmp/t.lmo) 字节"
+          sudo dpkg -P openclash-rt || true
+
+      - name: Verify /etc/openwrt_release carries an OpenWrt arch
+        run: |
+          # 回归守卫：包内 /etc/openwrt_release 曾经直接写 dpkg 架构（amd64），
+          # 而上游 uci-defaults 的 case 只认 OpenWrt 架构词汇 —— `amd64` 不匹配
+          # 任何分支，落到兜底 `*)` → CORE_ARCH=0 → 内核下载链接错误，
+          # 且界面只显示"下载失败"，极难定位。
+          # 这里直接从包里取值，不依赖安装。
+          DEB="$(ls dist/openclash-rt_*.deb | head -1)"
+          TMP="$(mktemp -d)"
+          dpkg-deb -x "$DEB" "$TMP"
+          A="$(sed -n "s/^DISTRIB_ARCH='\([^']*\)'.*/\1/p" "$TMP/etc/openwrt_release")"
+          echo "包内 DISTRIB_ARCH=$A"
+          case "$A" in
+            "") echo "::error::/etc/openwrt_release 缺失或 DISTRIB_ARCH 为空"; exit 1 ;;
+            amd64|arm64|armhf|armel|i386|riscv64|loong64)
+              echo "::error::$A 是 Debian/dpkg 架构而非 OpenWrt 架构，上游会判 CORE_ARCH=0"; exit 1 ;;
+          esac
+          echo "::notice::DISTRIB_ARCH=$A 是 OpenWrt 架构词汇 ✓"
+      - name: Install & end-to-end (real .deb, real paths, real nftables)
+        run: |
+          # 装上 e2e 会用到的可选依赖，让更多断言真正执行而不是 SKIP
+          sudo apt-get install -y --no-install-recommends nftables dnsmasq util-linux
+          sudo bash tests/e2e/linux/run-e2e.sh --deb "$(ls dist/openclash-rt_*.deb | head -1)"
+      - name: Verify uninstall leaves DNS intact
+        run: |
+          dpkg -s openclash-rt && exit 1 || echo "包已卸载 ✓"
+          test -f /etc/dnsmasq.d/00-openclash-rt-uci.conf \
+            && { echo "卸载后残留 dnsmasq 劫持配置（会导致整机断网）"; exit 1; } \
+            || echo "dnsmasq 配置已清理 ✓"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openclash-rt-deb
+          path: dist/*.deb

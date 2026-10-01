@@ -1,0 +1,23 @@
+# 由 scripts/fetch-luci-vendor.sh 生成，请勿手改
+LUCI_REPO=https://github.com/openwrt/luci.git
+LUCI_REF=openwrt-21.02
+LUCI_COMMIT=e4c46338b196e486a88b1a75b78e283708c82bc4
+LUCI_SHORT=e4c4633
+LUCI_DATE=2023-07-27T13:12:12+02:00
+LUCI_SUBJECT=luci-app-firewall: add reflection_zone field to forwards
+LUCIHTTP_REPO=https://github.com/jow-/lucihttp.git
+LUCIHTTP_REF=master
+LUCIHTTP_COMMIT=9b5b683fbb2bb0010aa031d620d0ab8105516757
+LUCIHTTP_SHORT=9b5b683
+LIBNLTINY_REPO=https://github.com/openwrt/libnl-tiny.git
+LIBNLTINY_REF=master
+LIBNLTINY_COMMIT=40493a655d8caa2ccf5206dde1e733abe2920432
+LIBNLTINY_SHORT=40493a6
+UBUS_REPO=https://github.com/openwrt/ubus.git
+UBUS_REF=master
+UBUS_COMMIT=414c60a2e29e72c2c4f573bc50ad54aef076d169
+UBUS_SHORT=414c60a
+RPCD_REPO=https://github.com/openwrt/rpcd.git
+RPCD_REF=master
+RPCD_COMMIT=a6c6b63b47bd8f4f762ef2e6787210cd3e0fb8a0
+RPCD_SHORT=a6c6b63

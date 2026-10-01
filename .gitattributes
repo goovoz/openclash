@@ -1,0 +1,31 @@
+# Force LF on checkout.  eol=lf is the strongest form and overrides any
+# inherited `text=auto` from the `*` rule.
+* eol=lf
+
+# Always-binary regardless of heuristics
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.mp3   binary
+*.mp4   binary
+*.ogg   binary
+*.webm  binary
+*.so    binary
+*.lmo   binary
+*.mmdb  binary
+*.mrs   binary
+*.idx   binary
+*.pack  binary
+*.rev   binary
+
+# Make sh/lua explicit for reviewers; same effect as * eol=lf but readable
+*.sh  eol=lf
+*.lua eol=lf

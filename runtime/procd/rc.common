@@ -1,0 +1,223 @@
+#!/bin/sh
+# =============================================================================
+# OpenClash-RT  rc.common compatibility shim
+# -----------------------------------------------------------------------------
+# 上游 /etc/init.d/openclash 的 shebang 是：
+#     #!/bin/sh /etc/rc.common
+# 内核实际执行：/bin/sh /etc/rc.common /etc/init.d/openclash <action> [args...]
+# 因此本文件必须接收 $1=init 脚本路径、$2=action，其余为附加参数。
+#
+# 与 OpenWrt 原版 rc.common 的差异（刻意为之）：
+#   - enable/disable/enabled 映射到 systemctl，不再操作 /etc/rc.d/S?? 软链
+#   - 通过 procd.sh 垫片把 procd 语义落到 systemd
+#   - 其余 dispatch 语义与原版保持一致，确保上游脚本零修改
+# =============================================================================
+
+: "${IPKG_INSTROOT:=}"
+
+# -----------------------------------------------------------------------------
+# Shell 兼容处理
+# 上游 init 脚本的 shebang 固定为 "#!/bin/sh /etc/rc.common"，内核会用 /bin/sh
+# 执行本文件。而 Debian 的 /bin/sh 是 dash，OpenWrt 的 /lib/functions.sh 等库
+# 使用的是 ash/bash 方言（如 ${var:0:-1}），dash 不支持。
+# 因此这里在必要时把整个进程重新 exec 到 bash —— 这是唯一不改上游一行、
+# 又能保证 shell 方言一致的做法。
+# 可用 OPENCLASH_RT_SHELL 指定替代解释器。
+# -----------------------------------------------------------------------------
+if [ -z "${BASH_VERSION:-}" ] && [ -z "${_OC_RT_REEXEC:-}" ]; then
+	_oc_rt_sh="${OPENCLASH_RT_SHELL:-/bin/bash}"
+	if [ -x "$_oc_rt_sh" ]; then
+		_OC_RT_REEXEC=1
+		export _OC_RT_REEXEC
+		exec "$_oc_rt_sh" "$0" "$@"
+	fi
+fi
+
+. "$IPKG_INSTROOT/lib/functions.sh"
+. "$IPKG_INSTROOT/lib/functions/service.sh"
+
+initscript=$1
+action=${2:-help}
+shift 2
+
+start() { return 0; }
+stop() { return 0; }
+
+reload() {
+	restart
+}
+
+restart() {
+	trap '' TERM
+	stop "$@"
+	trap - TERM
+	start "$@"
+}
+
+boot() {
+	start "$@"
+}
+
+shutdown() {
+	stop
+}
+
+_svc_unit_name() {
+	local name
+	name="$(basename "$initscript")"
+	name="${name##[SK][0-9][0-9]}"
+	printf '%s.service' "$name"
+}
+
+disable() {
+	local unit
+	unit="$(_svc_unit_name)"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl disable "$unit"
+		return $?
+	fi
+	rm -f "$IPKG_INSTROOT/etc/rc.d/S??$(basename "$initscript")"
+	return 0
+}
+
+enable() {
+	local unit
+	unit="$(_svc_unit_name)"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl enable "$unit"
+		return $?
+	fi
+	return 1
+}
+
+enabled() {
+	local unit
+	unit="$(_svc_unit_name)"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl is-enabled --quiet "$unit" 2>/dev/null
+		return $?
+	fi
+	return 1
+}
+
+depends() {
+	return 0
+}
+
+ALL_HELP=""
+ALL_COMMANDS="boot shutdown depends"
+extra_command() {
+	local cmd="$1"
+	local help="$2"
+	local extra
+	extra="$(printf '%-16s%s' "$cmd" "$help")"
+	ALL_HELP="${ALL_HELP}\t${extra}\n"
+	ALL_COMMANDS="${ALL_COMMANDS} ${cmd}"
+}
+
+help() {
+	cat <<EOF
+Syntax: $initscript [command]
+
+Available commands:
+EOF
+	printf '%b' "$ALL_HELP"
+}
+
+# --- procd 回调的默认实现（上游会覆盖 start_service / stop_service 等） ------
+start_service() { return 0; }
+stop_service() { return 0; }
+service_triggers() { return 0; }
+
+service_running() {
+	local instance="${1:-*}"
+	procd_running "$(basename "$initscript")" "$instance"
+}
+
+[ -n "${INIT_TRACE:-}" ] && set -x
+
+extra_command "start"   "Start the service"
+extra_command "stop"    "Stop the service"
+extra_command "restart" "Restart the service"
+extra_command "reload"  "Reload configuration files (or restart if service does not implement reload)"
+extra_command "enable"  "Enable service autostart"
+extra_command "disable" "Disable service autostart"
+extra_command "enabled" "Check if service is started on boot"
+
+# 载入目标 init 脚本（同一进程内，共享函数与变量）
+. "$initscript"
+
+if [ -n "$USE_PROCD" ]; then
+	extra_command "running" "Check if service is running"
+	extra_command "status"  "Service status"
+	extra_command "info"    "Dump service runtime info"
+
+	. "$IPKG_INSTROOT/lib/functions/procd.sh"
+
+	basescript="$(readlink "$initscript")"
+	_SVC_NAME="$(basename "${basescript:-$initscript}")"
+
+	rc_procd() {
+		procd_open_service "$_SVC_NAME" "$initscript"
+		"$@"
+		procd_close_service set
+	}
+
+	start() {
+		rc_procd start_service "$@"
+		if eval "type service_started" >/dev/null 2>&1; then
+			service_started
+		fi
+	}
+
+	stop() {
+		procd_lock
+		stop_service "$@"
+		procd_kill "$_SVC_NAME" "$1"
+		if eval "type service_stopped" >/dev/null 2>&1; then
+			service_stopped
+		fi
+	}
+
+	reload() {
+		if eval "type reload_service" >/dev/null 2>&1; then
+			procd_lock
+			reload_service "$@"
+		else
+			start
+		fi
+	}
+
+	running() {
+		service_running "$@"
+	}
+
+	status() {
+		if eval "type status_service" >/dev/null 2>&1; then
+			status_service "$@"
+		else
+			_procd_status "$_SVC_NAME" "$1"
+		fi
+	}
+
+	info() {
+		printf 'service: %s\n' "$_SVC_NAME"
+		printf 'script:  %s\n' "$initscript"
+		printf 'root:    %s\n' "${OPENCLASH_RT_ROOT:-/run/openclash/rt}"
+		procd_running "$_SVC_NAME" && echo "state:   running" || echo "state:   stopped"
+	}
+fi
+
+ALL_COMMANDS="${ALL_COMMANDS} ${EXTRA_COMMANDS:-}"
+ALL_HELP="${ALL_HELP}${EXTRA_HELP:-}"
+
+if command -v list_contains >/dev/null 2>&1; then
+	list_contains ALL_COMMANDS "$action" || action=help
+else
+	case " $ALL_COMMANDS " in
+		*" $action "*) : ;;
+		*) action=help ;;
+	esac
+fi
+
+"$action" "$@"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync openclash-rt UCI dhcp settings into dnsmasq configuration
+Documentation=https://github.com/vernesong/OpenClash
+# 上游 OpenClash 只写 UCI（dhcp.@dnsmasq[0]），Debian 的 dnsmasq 不读 UCI。
+# 本单元负责把 OpenClash 托管的那几个选项翻译到 /etc/dnsmasq.d/。
+# 由 openclash-rt-dnsmasq-sync.path 监听 /etc/config/dhcp 变化触发。
+ConditionPathExists=/usr/lib/openclash-rt/dnsmasq-adapter.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/openclash-rt/dnsmasq-adapter.sh
+# 适配器本身幂等；失败不应让系统进入 failed 状态而阻塞后续
+SuccessExitStatus=0

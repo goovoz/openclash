@@ -1,0 +1,47 @@
+Package: openclash-rt
+Version: @PKG_VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: openclash-rt maintainers
+Depends: bash,
+         coreutils,
+         findutils,
+         grep,
+         sed,
+         gawk,
+         curl,
+         ca-certificates,
+         unzip,
+         ruby,
+         iproute2,
+         procps,
+         sysvinit-utils,
+         cron,
+         nftables,
+         dnsmasq,
+         lua5.1,
+         libc6 (>= 2.31)
+Recommends: kmod,
+            ipset,
+            iputils-ping,
+            bind9-dnsutils,
+            socat
+Suggests: docker.io
+Built-Using: OpenClash @UPSTREAM_VERSION@ (commit @UPSTREAM_COMMIT@)
+Description: OpenClash for Debian/Ubuntu servers (OpenWrt compatibility runtime)
+ OpenClash 是为 OpenWrt 开发的 Mihomo(Clash) 客户端插件，其代码依赖
+ OpenWrt 的 UCI 配置系统、procd 服务管理、fw4/nftables 防火墙表结构
+ 以及 LuCI。
+ .
+ 本包提供一套「OpenWrt 兼容运行时」，使上游 OpenClash 代码无需任何修改
+ 即可在 Debian/Ubuntu 无桌面服务器上运行，包括：
+   * uci (libubox + uci) 用户态实现，提供 /sbin/uci 与 Lua 绑定
+   * /etc/rc.common 与 procd 函数垫片，把 procd 语义落到 systemd
+   * /lib/functions.sh、/lib/config/uci.sh 等 OpenWrt shell 库
+   * 适配服务器语义的网络探测与 DNS/dnsmasq 集成
+ .
+ 设计目标是 100% 功能复刻，并保持与上游同步更新的能力。
+ .
+ 本包基于 MIT 许可的 OpenClash 及 LGPL-2.1 许可的 OpenWrt uci/libubox 构建，
+ 详见 /usr/share/doc/openclash-rt/copyright。

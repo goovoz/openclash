@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tests/mock/bin/nft —— 最小 nftables 模拟器
+# -----------------------------------------------------------------------------
+# 目的：让 runtime/net/fw4 的骨架/幂等/include 逻辑可以在非 Linux 环境
+#       （Windows/MSYS、macOS）下被真实验证，而不需要 CAP_NET_ADMIN。
+#
+# 支持的上游用法（取自 docs/03-路径契约.md §2.3）：
+#   nft add table inet fw4
+#   nft add chain inet fw4 <chain> { type <t> hook <h> priority <p>; policy accept; }
+#   nft delete table inet fw4
+#   nft list table inet fw4
+#   nft list chain inet fw4 <chain>
+#   nft -a list chain inet fw4 <chain>
+#   nft list chains
+#   nft -f -            （从 stdin 读语句，逐行执行）
+#
+# 状态目录：$MOCK_NFT_STATE（默认 /tmp/mock-nft）
+#   布局： <state>/<family>.<table>/table
+#          <state>/<family>.<table>/<chain>.chain   （内容为链定义体）
+#
+# 刻意复刻的真实行为：
+#   - `add table` 已存在 -> 报 "File exists" 并退出 1
+#   - `add chain` 已存在 -> 报 "File exists" 并退出 1
+#   - `list chain` 不存在 -> 退出 1
+#   这些正是 fw4 垫片做幂等判断的依据，必须如实模拟。
+# =============================================================================
+set -u
+
+STATE="${MOCK_NFT_STATE:-/tmp/mock-nft}"
+mkdir -p "$STATE" 2>/dev/null
+
+# 真实 nft 接受「整条语句作为单个参数」的形式，例如：
+#   nft "add table inet fw4"
+#   nft 'add chain inet fw4 input { type filter hook input priority 0; policy accept; }'
+# fw4 垫片正是这样调用的（见 runtime/net/fw4 的 _oc_fw4_nft）。
+# 因此这里必须先按空白重新分词，否则 $1 会是整条语句。
+if [ "$#" -eq 1 ] && [ "${1#* }" != "$1" ]; then
+	# shellcheck disable=SC2086
+	set -- $1
+fi
+
+_err() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+_norm() { printf '%s' "$*" | tr -s ' \t' ' ' | sed 's/^ //; s/ $//'; }
+
+_tbl_dir()  { printf '%s/%s.%s'   "$STATE" "$1" "$2"; }
+_chain_f()  { printf '%s/%s.chain' "$(_tbl_dir "$1" "$2")" "$3"; }
+
+_has_table() { [ -f "$(_tbl_dir "$1" "$2")/table" ]; }
+_has_chain() { [ -f "$(_chain_f "$1" "$2" "$3")" ]; }
+
+# 去掉链定义的外层 { }，只留内部语句。
+# 注意必须输出【结尾换行】：bash 的 read 在 EOF 无分隔符时返回非零，
+# `while read` 会整体跳过该行。写入方与读取方都必须守这条约定。
+_chain_body() {
+	local s="$1"
+	s="${s#*\{}"
+	s="${s%\}}"
+	printf '%s\n' "$(_norm "$s")"
+}
+
+_cmd_add() {
+	local kind="$1"; shift
+	case "$kind" in
+		table)
+			local family="$1" table="$2"
+			[ -z "$table" ] && _err "syntax error"
+			_has_table "$family" "$table" && _err "File exists"
+			mkdir -p "$(_tbl_dir "$family" "$table")"
+			: >"$(_tbl_dir "$family" "$table")/table"
+			;;
+		chain)
+			local family="$1" table="$2" chain="$3"; shift 3
+			[ -z "$chain" ] && _err "syntax error"
+			_has_table "$family" "$table" || _err "No such file or directory"
+			_has_chain "$family" "$table" "$chain" && _err "File exists"
+			_chain_body "$*" >"$(_chain_f "$family" "$table" "$chain")"
+			;;
+		set)
+			local family="$1" table="$2" setname="$3"; shift 3
+			_has_table "$family" "$table" || _err "No such file or directory"
+			mkdir -p "$(_tbl_dir "$family" "$table")"
+			[ -f "$(_tbl_dir "$family" "$table")/$setname.set" ] && _err "File exists"
+			_chain_body "$*" >"$(_tbl_dir "$family" "$table")/$setname.set"
+			;;
+		rule|element)
+			local family="" table=""
+			# add rule <family> <table> <chain> ...  / add element <family> <table> <set> { ... }
+			family="$1"; table="$2"
+			_has_table "$family" "$table" || _err "No such file or directory"
+			;;
+		*) _err "unknown add target: $kind" ;;
+	esac
+	return 0
+}
+
+_cmd_delete() {
+	local kind="$1"; shift
+	case "$kind" in
+		table)
+			local family="$1" table="$2"
+			_has_table "$family" "$table" || _err "No such file or directory"
+			rm -rf "$(_tbl_dir "$family" "$table")"
+			;;
+		chain)
+			local family="$1" table="$2" chain="$3"
+			_has_chain "$family" "$table" "$chain" || _err "No such file or directory"
+			rm -f "$(_chain_f "$family" "$table" "$chain")"
+			;;
+		set)
+			local family="$1" table="$2" setname="$3"
+			rm -f "$(_tbl_dir "$family" "$table")/$setname.set"
+			;;
+		rule|element) : ;;
+		*) _err "unknown delete target: $kind" ;;
+	esac
+	return 0
+}
+
+_list_chain() {
+	local family="$1" table="$2" chain="$3"
+	_has_chain "$family" "$table" "$chain" || _err "No such file or directory"
+	printf 'table %s %s {\n' "$family" "$table"
+	printf '\tchain %s { # handle 1\n' "$chain"
+	# 规则行也带 handle，便于上游 revert_firewall 的 `-a | grep | awk '{print$2}'`
+	local n=2
+	while IFS= read -r l || [ -n "$l" ]; do
+		[ -z "$l" ] && continue
+		printf '\t\t%s # handle %s\n' "$l" "$n"
+		n=$((n + 1))
+	done <"$(_chain_f "$family" "$table" "$chain")"
+	printf '\t}\n}\n'
+}
+
+_list_table() {
+	local family="$1" table="$2"
+	_has_table "$family" "$table" || _err "No such file or directory"
+	printf 'table %s %s {\n' "$family" "$table"
+	local f c
+	for f in "$(_tbl_dir "$family" "$table")"/*.chain; do
+		[ -f "$f" ] || continue
+		c="$(basename "$f" .chain)"
+		printf '\tchain %s {\n' "$c"
+		while IFS= read -r l || [ -n "$l" ]; do
+			[ -z "$l" ] && continue
+			printf '\t\t%s\n' "$l"
+		done <"$f"
+		printf '\t}\n'
+	done
+	for f in "$(_tbl_dir "$family" "$table")"/*.set; do
+		[ -f "$f" ] || continue
+		c="$(basename "$f" .set)"
+		printf '\tset %s {\n' "$c"
+		while IFS= read -r l || [ -n "$l" ]; do
+			[ -z "$l" ] && continue
+			printf '\t\t%s\n' "$l"
+		done <"$f"
+		printf '\t}\n'
+	done
+	printf '}\n'
+}
+
+_list_all_chains() {
+	local d t c
+	for d in "$STATE"/*/; do
+		[ -d "$d" ] || continue
+		t="$(basename "$d")"
+		for c in "$d"*.chain; do
+			[ -f "$c" ] || continue
+			printf 'table %s %s {\n\tchain %s {\n\t}\n}\n' \
+				"${t%%.*}" "${t#*.}" "$(basename "$c" .chain)"
+		done
+	done
+}
+
+_list_all_sets() {
+	local d t s
+	for d in "$STATE"/*/; do
+		[ -d "$d" ] || continue
+		t="$(basename "$d")"
+		for s in "$d"*.set; do
+			[ -f "$s" ] || continue
+			printf 'table %s %s {\n\tset %s {\n\t}\n}\n' \
+				"${t%%.*}" "${t#*.}" "$(basename "$s" .set)"
+		done
+	done
+}
+
+# 去掉 -a / --numeric 等全局选项
+ANON=0; SILENT=0
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-a|--handle|-n|--numeric|-s|--stateless|-c|--check)
+			[ "$1" = "-a" ] && ANON=1
+			shift ;;
+		*) break ;;
+	esac
+done
+
+# nft -f -  ：从 stdin 逐行执行
+if [ "${1:-}" = "-f" ]; then
+	shift
+	[ "${1:-}" = "-" ] && shift
+	rc=0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+		case "$line" in
+			""|\#*) continue ;;
+		esac
+		# shellcheck disable=SC2086
+		if ! "$0" $line >/dev/null 2>&1; then
+			rc=1
+		fi
+	done
+	exit "$rc"
+fi
+
+ACTION="${1:-}"; shift || true
+
+case "$ACTION" in
+	add)
+		CMD="${1:-}"; shift || true
+		# add chain inet fw4 x { ... }  —— 花括号在原始 argv 里是独立或粘连的
+		_cmd_add "$CMD" "$@"
+		;;
+	delete|del)
+		CMD="${1:-}"; shift || true
+		_cmd_delete "$CMD" "$@"
+		;;
+	list)
+		CMD="${1:-}"; shift || true
+		case "$CMD" in
+			table)
+				if [ "$#" -ge 2 ]; then _list_table "$1" "$2"
+				elif [ "$#" -eq 1 ]; then
+					local d
+					for d in "$STATE"/*/; do
+						[ -d "$d" ] || continue
+						t="$(basename "$d")"
+						printf 'table %s %s\n' "${t%%.*}" "${t#*.}"
+					done
+				else _err "syntax error"
+				fi
+				;;
+			chain)
+				if [ "$#" -eq 3 ]; then
+					_list_chain "$1" "$2" "$3"
+				elif [ "$#" -eq 2 ]; then
+					_list_all_chains
+				else
+					_err "syntax error"
+				fi
+				;;
+			chains) _list_all_chains ;;
+			sets)   _list_all_sets ;;
+			ruleset)
+				for d in "$STATE"/*/; do
+					[ -d "$d" ] || continue
+					t="$(basename "$d")"
+					_list_table "${t%%.*}" "${t#*.}" || true
+				done
+				;;
+			*) _err "unknown list target: $CMD" ;;
+		esac
+		;;
+	flush)
+		CMD="${1:-}"; shift || true
+		[ "$CMD" = "ruleset" ] && rm -rf "$STATE"/* 2>/dev/null
+		;;
+	-h|--help|"")
+		printf 'mock nft (openclash-rt tests)\n'
+		;;
+	*)
+		_err "unknown command: $ACTION"
+		;;
+esac
+
+exit 0

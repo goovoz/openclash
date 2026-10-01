@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# =============================================================================
+# 测试/引导用 uci 桩
+# -----------------------------------------------------------------------------
+# 用途：
+#   1) 在无 libubox/uci C 构建的环境里跑通 openclash-rt 的集成测试
+#   2) 作为 .deb 首次安装时「真实 uci 尚未就绪」的兜底（生产走真 uci）
+#
+# DB 格式（MOCK_UCI_DB 指向的文件，纯文本）：
+#   #SECTION <pkg>.<name>=<type>      定义 section 及其类型
+#   <pkg>.<name>.<option>=<value>     定义 option
+#
+# 支持子命令：get / show / set / add / delete / del / commit / rename
+#            add_list / del_list / export / changes / revert
+# 支持参数：-q -n -S -N -c <dir> -P <state> -t <file>
+# =============================================================================
+
+DB="${MOCK_UCI_DB:-/etc/config/.mock-uci.db}"
+QUIET=0
+SHELL_FMT=0
+NAME_SECTIONS=0
+ARGS=()
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-q) QUIET=1 ;;
+		-n) NAME_SECTIONS=1 ;;
+		-S) SHELL_FMT=1 ;;
+		-N) NAME_SECTIONS=1 ;;
+		-c|-P|-t|-p) shift ;;
+		*) ARGS+=("$1") ;;
+	esac
+	shift
+done
+
+cmd="${ARGS[0]:-}"
+
+touch "$DB" 2>/dev/null
+_die() { [ "$QUIET" = 1 ] || printf '%s\n' "$1" >&2; exit "${2:-1}"; }
+
+# 与目标文件**同目录**的临时文件。
+#
+# ⚠️ 这里刻意不用 mktemp：受限环境（含本机 Windows/MSYS 沙箱）的 TMPDIR 可能是
+#    `C:\Users\...\Temp` 这样的盘符路径，mktemp 会返回该前缀的路径，之后对它做
+#    mv/rm 会被安全策略判为 "embedded drive prefix" 而**直接挂死**。
+#    实测症状是非确定性超时：只有当 key 已存在（走改写分支）时才触发，
+#    新 key 走 append 分支就正常，排障时极具迷惑性。
+#    同目录还有个好处：mv 是同文件系统替换，原子生效。
+_tmp_for() { printf '%s.tmp.%s' "$1" "$$"; }
+
+_get() {
+	local key="$1"
+	# 真实 uci 的语义：`uci get <section>` 返回该 section 的**类型**，
+	# `uci get <section>.<option>` 返回 option 值。两者都要支持，
+	# 否则 `uci -q get openclash.config` 这类存在性探测会得到假阴性。
+	awk -v k="$key" -F'=' '
+		/^#SECTION / {
+			pos = index($0,"="); full = substr($0,10,pos-10); ty = substr($0,pos+1);
+			if (full == k) { print ty; found=1; exit }
+			next
+		}
+		{ pos = index($0, "="); if (substr($0,1,pos-1) == k) { print substr($0,pos+1); found=1; exit } }
+		END { exit(found ? 0 : 1) }
+	' "$DB"
+}
+
+_section_type() {
+	local sec="$1"
+	# 用**段全名**（pkg.name）比对，打印其类型。
+	# 注意不能拿类型去比对——那样 `show dhcp.main` 不会输出段定义行，
+	# 而上游 init.d:16 正是靠 `show` 的首行取 CFGID。
+	awk -v s="$sec" -F'=' '
+		/^#SECTION / {
+			pos = index($0,"="); full = substr($0,10,pos-10);
+			if (full == s) { print substr($0,pos+1); found=1; exit }
+		}
+		END { exit(found ? 0 : 1) }
+	' "$DB"
+}
+
+_sections_of() {
+	local pkg="$1"
+	awk -v p="$pkg" -F'=' '
+		/^#SECTION / {
+			pos = index($0,"="); full = substr($0,10,pos-10);
+			split(full, a, "."); if (a[1] == p) print a[2];
+		}
+	' "$DB" | awk '!seen[$0]++' | tr '\n' ' '
+}
+
+# 某包内指定类型的所有段名，**按文件顺序**输出（每行一个）
+_sections_of_type() {
+	local pkg="$1" ty="$2"
+	awk -v p="$pkg" -v t="$ty" -F'=' '
+		/^#SECTION / {
+			pos = index($0,"="); full = substr($0,10,pos-10); typ = substr($0,pos+1);
+			split(full, a, ".");
+			if (a[1] == p && typ == t) print a[2];
+		}
+	' "$DB"
+}
+
+# 解析 OpenWrt 的匿名段引用：<pkg>.@<type>[<idx>][.<option>]  →  <pkg>.<name>[.<option>]
+#   idx 支持负数（-1 = 最后一个），与真实 uci 一致。
+# 上游有 100+ 处使用 `dhcp.@dnsmasq[0]` / `@dnsmasq[-1]` 这种写法，
+# 桩若不解析，这些调用会全部得到假阴性。
+# 成功时打印解析结果并返回 0；不是匿名引用或解析失败则返回 1。
+_resolve_ref() {
+	local key="$1" pkg ref suffix type idx names n name
+
+	pkg="${key%%.*}"
+	ref="${key#*.}"
+	[ "$ref" != "$key" ] || return 1
+
+	# 拆出可选后缀
+	case "$ref" in
+		*.*) suffix=".${ref#*.}"; ref="${ref%%.*}" ;;
+		*)   suffix="" ;;
+	esac
+
+	# 必须是 @type[idx] 形式
+	case "$ref" in
+		'@'*'['*']') : ;;
+		*) return 1 ;;
+	esac
+	type="${ref#@}"; type="${type%%\[*}"
+	idx="${ref##*\[}"; idx="${idx%\]}"
+
+	names="$(_sections_of_type "$pkg" "$type")"
+	[ -n "$names" ] || return 1
+	n="$(printf '%s\n' "$names" | grep -c .)"
+	case "$idx" in
+		-*) idx=$((n + idx)) ;;
+	esac
+	[ "$idx" -ge 0 ] 2>/dev/null || return 1
+	[ "$idx" -lt "$n" ] 2>/dev/null || return 1
+
+	name="$(printf '%s\n' "$names" | sed -n "$((idx + 1))p")"
+	[ -n "$name" ] || return 1
+	printf '%s.%s%s' "$pkg" "$name" "$suffix"
+}
+
+_quote() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+case "$cmd" in
+	get)
+		key="${ARGS[1]:-}"
+		[ -z "$key" ] && _die "uci: missing key"
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		v="$(_get "$key")" || _die "uci: Entry not found" 1
+		printf '%s\n' "$v"
+		exit 0
+		;;
+
+	show)
+		key="${ARGS[1]:-}"
+		if [ -z "$key" ]; then
+			awk '/^#SECTION / { next } { pos=index($0,"="); print substr($0,1,pos-1)"="substr($0,pos+1) }' "$DB"
+			exit 0
+		fi
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		case "$key" in
+			*.*.*)
+				v="$(_get "$key")" || _die "uci: Entry not found" 1
+				printf "%s='%s'\n" "$key" "$v"
+				;;
+			*.*)
+				pkg="${key%%.*}"; sec="${key#*.}"
+				ty="$(_section_type "$key")" 2>/dev/null
+				if [ -n "$ty" ]; then printf "%s=%s\n" "$key" "$ty"; fi
+				awk -v p="$pkg" -v s="$sec" -F'=' '
+					/^#SECTION / { next }
+					{ pos=index($0,"="); k=substr($0,1,pos-1); v=substr($0,pos+1);
+					  if (k ~ ("^"p"\\."s"\\.")) print k"=\x27"v"\x27" }
+				' "$DB"
+				exit 0
+				;;
+			*)
+				awk -v p="$key" -F'=' '
+					/^#SECTION / { next }
+					{ pos=index($0,"="); k=substr($0,1,pos-1); v=substr($0,pos+1);
+					  if (k ~ ("^"p"\\.")) print k"=\x27"v"\x27" }
+				' "$DB"
+				exit 0
+				;;
+		esac
+		;;
+
+	set)
+		kv="${ARGS[1]:-}"
+		[ -z "$kv" ] && _die "uci: missing key=value"
+		key="${kv%%=*}"; val="${kv#*=}"
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		kv="$key=$val"
+		if grep -q "^${key}=" "$DB" 2>/dev/null; then
+			tmp="$(_tmp_for "$DB")"
+			if awk -v k="$key" -v v="$val" -F'=' '
+				{ pos=index($0,"="); if (substr($0,1,pos-1)==k) { print k"="v; next } print }
+			' "$DB" >"$tmp" && mv -f "$tmp" "$DB"; then
+				:
+			else
+				rm -f "$tmp" 2>/dev/null
+				_die "uci: 写入 $DB 失败"
+			fi
+		else
+			printf '%s=%s\n' "$key" "$val" >>"$DB"
+		fi
+		exit 0
+		;;
+
+	add)
+		pkg="${ARGS[1]:-}"; ty="${ARGS[2]:-}"
+		[ -z "$pkg" ] || [ -z "$ty" ] && _die "uci: usage: add <package> <type>"
+		n=1
+		while _section_type "$pkg.cfg$n" >/dev/null 2>&1; do n=$((n + 1)); done
+		printf '#SECTION %s.cfg%s=%s\n' "$pkg" "$n" "$ty" >>"$DB"
+		printf 'cfg%s\n' "$n"
+		exit 0
+		;;
+
+	delete|del|remove)
+		key="${ARGS[1]:-}"
+		[ -z "$key" ] && _die "uci: missing key"
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		tmp="$(_tmp_for "$DB")"
+		if [ "${key%%.*}" = "$key" ]; then
+			grep -v "^#SECTION ${key}\." "$DB" | grep -v "^${key}\." >"$tmp"
+		elif [ "${key##*.}" = "$key" ]; then
+			grep -v "^#SECTION ${key}=" "$DB" | grep -v "^${key}\." >"$tmp"
+		else
+			grep -v "^${key}=" "$DB" >"$tmp"
+		fi
+		mv -f "$tmp" "$DB" || { rm -f "$tmp" 2>/dev/null; _die "uci: 写入 $DB 失败"; }
+		exit 0
+		;;
+
+	commit|revert)
+		exit 0
+		;;
+
+	changes)
+		exit 0
+		;;
+
+	rename)
+		kv="${ARGS[1]:-}"
+		old="${kv%%=*}"; new="${kv#*=}"
+		tmp="$(_tmp_for "$DB")"
+		sed "s/^${old}\./${new}./" "$DB" | sed "s/^#SECTION ${old}=/#SECTION ${new}=/" >"$tmp"
+		mv -f "$tmp" "$DB" || { rm -f "$tmp" 2>/dev/null; _die "uci: 写入 $DB 失败"; }
+		exit 0
+		;;
+
+	add_list)
+		kv="${ARGS[1]:-}"
+		key="${kv%%=*}"; val="${kv#*=}"
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		cur="$(_get "$key")"
+		if [ -n "$cur" ]; then val="$cur $val"; fi
+		"$0" -q set "$key=$val"
+		exit 0
+		;;
+
+	del_list)
+		kv="${ARGS[1]:-}"
+		key="${kv%%=*}"; val="${kv#*=}"
+		rk="$(_resolve_ref "$key")" && key="$rk"
+		cur="$(_get "$key")"
+		"$0" -q set "$key=$(printf '%s' "$cur" | tr ' ' '\n' | grep -vx "$val" | tr '\n' ' ' | sed 's/ *$//')"
+		exit 0
+		;;
+
+	export)
+		pkg="${ARGS[1]:-}"
+		[ -z "$pkg" ] && _die "uci: usage: export <package>"
+		printf 'export CONFIG_SECTIONS=%s\n' "$(_quote "$(_sections_of "$pkg" | sed 's/ *$//')")"
+		printf 'export CONFIG_NUM_SECTIONS=%s\n' "$(_sections_of "$pkg" | wc -w)"
+		awk -v p="$pkg" -F'=' '
+			/^#SECTION / {
+				pos=index($0,"="); full=substr($0,10,pos-10); split(full,a,".");
+				if (a[1]==p) printf "export CONFIG_%s_TYPE=%s\n", a[2], a[3];
+				next
+			}
+			{ pos=index($0,"="); k=substr($0,1,pos-1); v=substr($0,pos+1);
+			  split(k,b,"."); if (b[1]==p) printf "export CONFIG_%s_%s=%s\n", b[2], b[3], v }
+		' "$DB"
+		exit 0
+		;;
+
+	"" )
+		_die "uci: no command given"
+		;;
+
+	*)
+		_die "uci: unknown command '$cmd'"
+		;;
+esac

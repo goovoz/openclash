@@ -1,0 +1,123 @@
+#!/bin/sh
+# =============================================================================
+# 测试用 systemctl 桩
+# -----------------------------------------------------------------------------
+# 目的：在没有 systemd 的环境（如 Windows/MSYS、容器内）也能完整跑通
+#       openclash-rt 的 procd 垫片逻辑，验证生命周期、单元文件生成、注册表、
+#       procd_running / procd_kill / procd_send_signal 的真实行为。
+#
+# 状态目录由 MOCK_SYSTEMD_STATE 指定。每个单元对应：
+#   <state>/<unit>.active   存在即表示 active
+#   <state>/<unit>.pid      主进程 PID（start 时真实 spawn 一个 sleep）
+#   <state>/<unit>.enabled  enable 过
+# =============================================================================
+
+STATE="${MOCK_SYSTEMD_STATE:-/tmp/mock-systemd}"
+mkdir -p "$STATE" 2>/dev/null
+
+cmd="$1"
+shift
+
+QUIET=0
+VALUE=0
+PROP=""
+UNITS=""
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--quiet|-q)  QUIET=1 ;;
+		--value)     VALUE=1 ;;
+		--no-pager)  : ;;
+		-p)          PROP="$2"; shift ;;
+		-*)          : ;;
+		*)           UNITS="$UNITS $1" ;;
+	esac
+	shift
+done
+
+_act()  { [ -f "$STATE/$1.active" ]; }
+_pid()  { [ -f "$STATE/$1.pid" ] && cat "$STATE/$1.pid"; }
+
+case "$cmd" in
+	daemon-reload|reset-failed|reload)
+		exit 0
+		;;
+
+	start)
+		for u in $UNITS; do
+			if _act "$u" && kill -0 "$(_pid "$u")" 2>/dev/null; then
+				continue
+			fi
+			# 必须显式断开三个标准 fd：
+			#   否则 sleep 会继承调用方的管道写端，导致 `test.sh | tail` 之类的
+			#   组合在测试结束后仍等不到 EOF 而永久挂住（真实踩过）。
+			sleep 300 </dev/null >/dev/null 2>&1 &
+			echo $! >"$STATE/$u.pid"
+			: >"$STATE/$u.active"
+		done
+		exit 0
+		;;
+
+	stop)
+		for u in $UNITS; do
+			p="$(_pid "$u")"
+			[ -n "$p" ] && kill -TERM "$p" 2>/dev/null
+			rm -f "$STATE/$u.active"
+			rm -f "$STATE/$u.pid"
+		done
+		exit 0
+		;;
+
+	is-active)
+		for u in $UNITS; do
+			_act "$u" || { [ "$QUIET" = 1 ] || echo "inactive"; exit 3; }
+		done
+		[ "$QUIET" = 1 ] || echo "active"
+		exit 0
+		;;
+
+	show)
+		u="$UNITS"
+		u="${u# }"
+		case "$PROP" in
+			MainPID) printf '%s\n' "$(_pid "$u" | sed 's/^$/0/')" ;;
+			ActiveState) _act "$u" && echo "active" || echo "inactive" ;;
+			*) : ;;
+		esac
+		exit 0
+		;;
+
+	enable)
+		for u in $UNITS; do : >"$STATE/$u.enabled"; done
+		exit 0
+		;;
+
+	disable)
+		for u in $UNITS; do rm -f "$STATE/$u.enabled"; done
+		exit 0
+		;;
+
+	is-enabled)
+		for u in $UNITS; do
+			[ -f "$STATE/$u.enabled" ] || { [ "$QUIET" = 1 ] || echo "disabled"; exit 1; }
+		done
+		[ "$QUIET" = 1 ] || echo "enabled"
+		exit 0
+		;;
+
+	status)
+		for u in $UNITS; do
+			if _act "$u"; then
+				echo "● $u - active (running)"
+			else
+				echo "○ $u - inactive (dead)"
+			fi
+		done
+		exit 0
+		;;
+
+	*)
+		echo "mock-systemctl: unsupported command '$cmd'" >&2
+		exit 1
+		;;
+esac

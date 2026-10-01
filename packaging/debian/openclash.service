@@ -1,0 +1,43 @@
+[Unit]
+Description=OpenClash (OpenWrt compatibility runtime for Debian/Ubuntu)
+Documentation=https://github.com/vernesong/OpenClash
+# 为什么要等 ubusd / rpcd（不是可选项）：
+#   上游有 8 个 #!/usr/bin/lua 脚本（openclash_core.sh:57、openclash_update.sh:33
+#   等）会 require "luci.model.uci"，而该模块经 util.ubus("uci", ...) 走 ubus；
+#   uci 这个 ubus 对象由 **rpcd 内置**提供，rpcd 又必须连上 ubusd。
+#   顺序反了 → util.ubus 里的 assert 直接抛 "Unable to establish ubus connection"，
+#   而且是在 init 脚本中途炸，看起来像 OpenClash 自己的 bug。
+After=network-online.target nss-lookup.target ubusd.service rpcd.service
+Wants=network-online.target ubusd.service rpcd.service
+# dnsmasq 适配器要先把 UCI 翻译到 /etc/dnsmasq.d，随后上游才会 restart dnsmasq
+Wants=openclash-rt-dnsmasq-sync.service
+
+[Service]
+# 说明：
+#   本单元只负责调用上游 init 脚本的 boot/start/stop 入口。
+#   真正的守护进程（mihomo core、watchdog）由 rc.common + procd 垫片
+#   在 start_service 内以「运行时实例单元」的形式派生，单元名形如
+#     openclash-rt-<instance>.service
+#   它们由 /run/systemd/system 下的瞬态单元文件定义，重启即清空。
+Type=oneshot
+RemainAfterExit=yes
+
+# ---- 启动前补齐上游假定存在、但 Debian 不提供的前提 -------------------------
+# 1) /tmp 易失路径：dnsmasq conf-dir、resolv.conf 镜像、crontabs 等。
+#    缺失会导致上游静默降级（见 runtime/net/prepare-tmp.sh 头部说明）。
+ExecStartPre=/usr/lib/openclash-rt/prepare-tmp.sh
+# 2) nftables 骨架：上游只往 table inet fw4 插规则，从不建表也不建 base chain。
+#    失败不阻断启动（可能只是 nftables 未安装），但会让上游走不到 nft 路径。
+ExecStartPre=-/usr/sbin/fw4 check
+
+ExecStart=/etc/init.d/openclash boot
+ExecStop=/etc/init.d/openclash stop
+# reload 语义由上游 reload_service 实现，支持 firewall/manual/revert/restore
+ExecReload=/etc/init.d/openclash reload firewall
+TimeoutStartSec=300
+TimeoutStopSec=120
+# 上游脚本需要操作 nft/ip/tun，保持默认能力集即可（以 root 运行）
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

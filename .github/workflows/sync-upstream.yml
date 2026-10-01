@@ -1,0 +1,181 @@
+name: Sync Upstream OpenClash
+
+# 每日自动同步上游，并在补丁冲突时失败（GitHub 会给仓库所有者发通知邮件）。
+# 设计红线：L1 上游代码保持原样；patches/ 里的补丁一旦 apply 失败即视为
+# 「上游改动了我们依赖的代码」，必须人工介入，禁止静默漂移。
+
+on:
+  schedule:
+    # 每日 03:17 UTC（北京时间 11:17），避开整点高峰
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "上游分支"
+        required: false
+        default: "master"
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync upstream
+        id: sync
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bash scripts/sync-upstream.sh "${{ github.event.inputs.branch || 'master' }}" 2>&1 | tee /tmp/sync.log
+
+      - name: Collect version info
+        id: ver
+        if: always()
+        run: |
+          if [ -f upstream/.upstream-version ]; then
+            while IFS='=' read -r k v; do
+              echo "${k}=${v}" >> "$GITHUB_OUTPUT"
+            done < upstream/.upstream-version
+          fi
+
+      - name: Detect changes
+        id: diff
+        if: always()
+        run: |
+          if git diff --quiet -- upstream; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run compatibility tests
+        id: compat
+        if: always()
+        # continue-on-error 是必需的：兼容性回归同样要能开 issue（见下一步）。
+        # 之前这里没有 id/continue-on-error，于是「同步成功但上游改动了我们依赖
+        # 的写法」这一类回归**完全静默** —— 工作流直接红掉，却没有任何人被告知
+        # 究竟是哪条适配失效了。
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bash tests/test_procd_shim.sh
+          bash tests/test_upstream_load.sh
+          # ★ 新增：上游对「系统 lua = 5.1」的 11 处依赖是否仍是我们测绘过的那几种形态。
+          #   这是本项目**唯一**会对"上游改了调用写法"发出告警的检查：
+          #   上游若把 `lua /path` 改成 `lua -e ...`，pin-lua-interpreter.sh 的宽判据
+          #   会命中而窄规则覆盖不到 → 直接失败并打印 file:line（见 docs/04 §2.3）。
+          bash tests/test_pin_lua.sh
+          bash tests/test_luci_vendor_install.sh
+          # ★ 新增：上游对「vendor LuCI i18n 编译链」的依赖是否仍是 po2lmo.c 一个文件。
+          #   这条专门盯"上游改了 po2lmo.c（拆出 .o、增加 template_lmo.c 依赖、改要
+          #   lemon/flex）"这些工具链结构变更：上游若把 po2lmo 拆成 po2lmo.c +
+          #   template_lmo.c，install-vendor-lmo.sh 的"独立编译"锁会立刻命中而锁不动。
+          bash tests/test_luci_lmo_install.sh
+
+      - name: Commit synced upstream
+        if: steps.sync.outcome == 'success' && steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name  "openclash-rt bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add upstream
+          git commit -m "chore(upstream): sync ${{ steps.ver.outputs.PKG_VERSION }} @ ${{ steps.ver.outputs.SHORT }}"
+          git push
+
+      - name: Open issue on patch conflict
+        if: steps.sync.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/sync.log', 'utf8').slice(-6000); } catch (e) {}
+            const title = `上游同步失败 / 补丁冲突 @ ${new Date().toISOString().slice(0,10)}`;
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.some(i => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ['upstream-sync', 'needs-triage'],
+              body: [
+                '每日上游同步未能干净完成。**patches/ 中的补丁无法应用到新的上游代码**，说明上游改动了我方依赖的实现。',
+                '',
+                '处理步骤：',
+                '1. 本地执行 `scripts/sync-upstream.sh` 复现',
+                '2. 定位冲突文件，判断能否用 `runtime/` 兼容层吸收（首选）',
+                '3. 若必须改上游代码，更新 `patches/*.patch` 并在此 PR 说明理由',
+                '4. 跑通 `tests/` 全部用例后再合并',
+                '',
+                '```',
+                log,
+                '```'
+              ].join('\n')
+            });
+
+      - name: Open issue on compatibility regression
+        # 与下面那个"补丁冲突"步骤是**两种不同的失败**，必须分开报：
+        #   · sync 失败      = 上游代码本身拉不下来 / patches 打不上
+        #   · compat 失败    = 同步是成功的，但上游改动了我们依赖的**行为或写法**
+        # 后者更危险：工作流红掉但代码已经推进了一版，若不显式告知，
+        # 下一个人只会看到「测试挂了」而不知道该去比哪一条适配。
+        if: steps.sync.outcome == 'success' && steps.compat.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `上游同步后兼容性回归 @ ${new Date().toISOString().slice(0,10)}`;
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.some(i => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ['upstream-sync', 'needs-triage'],
+              body: [
+                '上游代码已成功拉取，但**兼容性测试失败** —— 说明上游改动了我们依赖的行为或写法。',
+                '',
+                `上游版本：\`${process.env.PKG_VERSION || '?'}\` @ \`${process.env.SHORT || '?'}\``,
+                '',
+                '处理步骤：',
+                '1. 本地执行 `bash scripts/sync-upstream.sh` 复现',
+                '2. 看失败的是哪一类：',
+                '   - `test_pin_lua.sh` → 上游改了「调用系统 lua」的写法。',
+                '     `runtime/upstream/pin-lua-interpreter.sh` 会打印 file:line；',
+                '     确认后到该脚本「规则定义」补规则（见 docs/04 §2.3）。',
+                '   - `test_procd_shim.sh` / `test_upstream_load.sh` → 行为契约变化，',
+                '     对照 `docs/03-路径契约.md` 判断哪一条失效。',
+                '   - `test_luci_vendor_install.sh` → 上游改了「vendor LuCI 落点/结构」：',
+                '     例如拆分了 module 文件、改了 htdocs 布局（抑合、或新增第四个 vendor 包）。',
+                '     对照 `docs/03 §3.1` 判断哪一行失效；变更后在 `install-vendor-luci.sh`',
+                '     补上 `module→file` 映射，或在 §3.1 表格中记录新映射。',
+                '   - `test_luci_lmo_install.sh` → 上游改了「po2lmo 编译链/落点」：',
+                '     例如拆出 .o 或新增 lemon/flex 依赖、改 .lmo 命名约定（破坏 fnmatch 通配）。',
+                '     对照 `docs/03 §3.2` 判断哪一行失效；变更后调整 `install-vendor-lmo.sh`',
+                '     的编译链/命名约定，并在 §3.2 表格中记录新映射。',
+                '3. 修好后把**失效的那条适配**记录更新到 `docs/03` 或 `docs/04`，',
+                '   并同步更新包内的 `packaging-adaptations.txt`（由 build-deb.sh 生成）。',
+                '',
+                '> 本项目不追求"永远绿"，追求的是**任何一条适配失效都有人被告知**。'
+              ].join('\n')
+            });
+        env:
+          PKG_VERSION: ${{ steps.ver.outputs.PKG_VERSION }}
+          SHORT: ${{ steps.ver.outputs.SHORT }}
+
+      - name: Fail job on sync error
+        if: steps.sync.outcome == 'failure'
+        run: exit 1
+
+      - name: Fail job on compatibility regression
+        if: steps.sync.outcome == 'success' && steps.compat.outcome == 'failure'
+        run: exit 1

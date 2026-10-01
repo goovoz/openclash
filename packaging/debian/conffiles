@@ -1,0 +1,4 @@
+/etc/config/openclash
+/etc/config/dhcp
+/etc/rc.common
+/etc/openwrt_release

@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# =============================================================================
+# openclash-rt  fw4 兼容垫片
+# -----------------------------------------------------------------------------
+# 存在的唯一理由：让 `command -v fw4` 成功。
+#
+# 上游 OpenClash 用 FW4=$(command -v fw4) 做 nft / iptables 二选一的开关
+# （init.d/openclash:15/2040，openclash.sh:27，openclash_chnroute.sh:20，
+#   openclash_watchdog.sh:17）。FW4 为空时上游会静默改走 iptables/ipset 路径，
+# 需要额外 4 个外部依赖（iptables/ip6tables/ipset/owner-match）。
+#
+# 本垫片让上游稳定走 nft 路径，并补齐上游假定「fw4 已建好」的那张表。
+#
+# ---- 上游假定存在、但自己从不创建的 7 个 base chain（见 docs/03-路径契约.md §2.3.2）
+#     权威来源：上游自己的 revert_firewall()，init.d/openclash:2922
+#         for nft in "input" "forward" "output" "dstnat" "srcnat" \
+#                    "nat_output" "mangle_prerouting" "mangle_output"; do
+#     其中 nat_output 由上游 set_firewall() 自建（init.d:1356），
+#     本垫片**故意不预建**它，否则上游的 `add chain` 会失败并留下无 hook 的死链。
+#
+# ---- 本垫片额外实现的部分：include 脚本执行（见 §2.3.5）
+#     OpenWrt 的 fw4 每次 reload 会执行所有 firewall.*=include 且 type=script
+#     的脚本。上游借此注册 /var/etc/openclash.include，
+#     内容为 `/etc/init.d/openclash reload "firewall"`。
+#     本垫片在 reload 时执行同样的逻辑，使「防火墙重载 → OpenClash 规则重建」
+#     在 Debian 上等价成立。
+#
+# 用法：
+#   fw4                 # 等价 check
+#   fw4 check           # 幂等断言骨架（静默，退出码表示结果）
+#   fw4 reload|restart  # 断言骨架 + 执行 include 脚本
+#   fw4 status|print    # 打印 table inet fw4
+#   fw4 flush           # 断言骨架（不删上游规则）
+#   fw4 stop            # 删除整张表（仅供卸载/排障）
+#   fw4 dry-run         # 只打印将要执行的 nft 语句
+#
+# 环境变量：
+#   OPENCLASH_RT_NFT       nft 可执行文件，默认自动探测
+#   OPENCLASH_RT_QUIET     置 1 时不打印非必要输出
+#   OPENCLASH_RT_DRY_RUN   置 1 时只打印不执行
+#   OPENCLASH_RT_SKELETON_DIR  额外落盘骨架的目录，默认 /etc/nftables.d
+# =============================================================================
+
+set -u
+
+OPENCLASH_RT_NFT="${OPENCLASH_RT_NFT:-}"
+OPENCLASH_RT_QUIET="${OPENCLASH_RT_QUIET:-}"
+OPENCLASH_RT_DRY_RUN="${OPENCLASH_RT_DRY_RUN:-0}"
+OPENCLASH_RT_SKELETON_DIR="${OPENCLASH_RT_SKELETON_DIR:-/etc/nftables.d}"
+
+RT_TABLE="fw4"
+RT_FAMILY="inet"
+RT_LOG_TAG="openclash-rt/fw4"
+
+# --- 基础工具 ---------------------------------------------------------------
+
+_oc_fw4_log() {
+	[ -n "$OPENCLASH_RT_QUIET" ] && return 0
+	printf '%s\n' "$*" >&2
+}
+
+_oc_fw4_err() {
+	printf '%s: %s\n' "$RT_LOG_TAG" "$*" >&2
+}
+
+_oc_fw4_find_nft() {
+	if [ -n "$OPENCLASH_RT_NFT" ]; then
+		printf '%s' "$OPENCLASH_RT_NFT"
+		return 0
+	fi
+	local p
+	for p in /usr/sbin/nft /sbin/nft /usr/bin/nft; do
+		[ -x "$p" ] && printf '%s' "$p" && return 0
+	done
+	p="$(command -v nft 2>/dev/null)" || true
+	[ -n "$p" ] && printf '%s' "$p"
+	return 0
+}
+
+NFT="$(_oc_fw4_find_nft)"
+
+# 执行一条 nft 语句（或从 stdin 读脚本）
+_oc_fw4_nft() {
+	if [ -z "$NFT" ]; then
+		_oc_fw4_err "找不到 nft 可执行文件（请安装 nftables）"
+		return 127
+	fi
+	if [ "$OPENCLASH_RT_DRY_RUN" = "1" ]; then
+		if [ "$#" -gt 0 ]; then _oc_fw4_log "nft $*"; else cat; fi
+		return 0
+	fi
+	if [ "$#" -gt 0 ]; then
+		"$NFT" "$@" 2>/dev/null
+	else
+		"$NFT" -f - 2>/dev/null
+	fi
+}
+
+_oc_fw4_has_table() {
+	[ "$OPENCLASH_RT_DRY_RUN" = "1" ] && return 1
+	[ -n "$NFT" ] || return 1
+	"$NFT" list table "$RT_FAMILY" "$RT_TABLE" >/dev/null 2>&1
+}
+
+_oc_fw4_has_chain() {
+	[ "$OPENCLASH_RT_DRY_RUN" = "1" ] && return 1
+	[ -n "$NFT" ] || return 1
+	"$NFT" list chain "$RT_FAMILY" "$RT_TABLE" "$1" >/dev/null 2>&1
+}
+
+# --- 骨架定义 ---------------------------------------------------------------
+#
+# 字段：chain  type    hook          priority(数值)  priority(助记符)
+#
+# 为什么用数值而非助记符：nft < 0.9.4 不认识 `priority filter` 这类符号名，
+# 数值在所有版本上通用。数值与助记符一一对应，见最后一列。
+#
+# 为什么 policy accept：
+#   OpenWrt 上 fw4 的 filter 基础链是 policy drop + 显式 jump 到 zone 链。
+#   服务器场景下 drop 会直接切断网络与 SSH。上游所有插入都带 `position 0`
+#   （永远排在链首），因此 policy accept 不影响 OpenClash 规则生效，
+#   只消除误封风险。详见 docs/03-路径契约.md §2.3.2。
+
+_oc_fw4_skeleton_spec() {
+	cat <<'SPEC'
+input|filter|input|0|filter
+forward|filter|forward|0|filter
+output|filter|output|0|filter
+dstnat|nat|prerouting|-100|dstnat
+srcnat|nat|postrouting|100|srcnat
+mangle_prerouting|filter|prerouting|-150|mangle
+mangle_output|filter|output|-150|mangle
+SPEC
+}
+
+_oc_fw4_chain_stmt() {
+	local chain="$1" type="$2" hook="$3" prio="$4"
+	printf 'add chain %s %s %s { type %s hook %s priority %s; policy accept; }\n' \
+		"$RT_FAMILY" "$RT_TABLE" "$chain" "$type" "$hook" "$prio"
+}
+
+# 断言骨架。幂等。返回 0 表示全部就绪。
+_oc_fw4_assert_skeleton() {
+	local rc=0 line chain type hook prio memo missing=""
+
+	if [ -z "$NFT" ] && [ "$OPENCLASH_RT_DRY_RUN" != "1" ]; then
+		_oc_fw4_err "找不到 nft，无法建立 $RT_TABLE 表"
+		return 127
+	fi
+
+	if ! _oc_fw4_has_table; then
+		_oc_fw4_nft "add table $RT_FAMILY $RT_TABLE" || true
+	fi
+
+	while IFS='|' read -r chain type hook prio memo; do
+		[ -z "$chain" ] && continue
+		if _oc_fw4_has_chain "$chain"; then
+			continue
+		fi
+		missing="$missing $chain"
+		_oc_fw4_nft "$(_oc_fw4_chain_stmt "$chain" "$type" "$hook" "$prio")" || rc=1
+	done <<EOF
+$(_oc_fw4_skeleton_spec)
+EOF
+
+	if [ -n "$missing" ]; then
+		_oc_fw4_log "已创建基础链:$missing"
+	fi
+
+	# 二次校验（dry-run 下跳过）
+	if [ "$OPENCLASH_RT_DRY_RUN" != "1" ]; then
+		local c
+		for c in input forward output dstnat srcnat mangle_prerouting mangle_output; do
+			_oc_fw4_has_chain "$c" || { _oc_fw4_err "基础链缺失: $c"; rc=1; }
+		done
+		# §2.3.2 反向断言：nat_output 必须不存在
+		if _oc_fw4_has_chain nat_output; then
+			_oc_fw4_err "检测到 nat_output 已被创建——上游会因此失败并留下无 hook 的死链"
+			_oc_fw4_err "若有其他工具创建了它，请移除后重试（见 docs/03-路径契约.md §2.3.2）"
+			rc=1
+		fi
+	fi
+
+	return "$rc"
+}
+
+# 把骨架落盘，供 Debian 的 nftables.service 在启动时自动重建
+_oc_fw4_persist_skeleton() {
+	local dir="$OPENCLASH_RT_SKELETON_DIR"
+	[ -d "$dir" ] || return 0
+	local out="$dir/10-openclash-rt.nft"
+	# 临时文件与目标同目录：不依赖 mktemp/TMPDIR（受限环境下 TMPDIR 可能是
+	# Windows 盘符路径等非法值），且保证 mv 是同文件系统的原子替换。
+	local tmp="$out.tmp.$$"
+	{
+		printf '#!/usr/sbin/nft -f\n'
+		printf '# generated by openclash-rt - do not edit\n'
+		printf '# 与 /usr/sbin/fw4 check 生成的骨架保持一致\n'
+		printf 'table %s %s {\n' "$RT_FAMILY" "$RT_TABLE"
+		while IFS='|' read -r chain type hook prio memo; do
+			[ -z "$chain" ] && continue
+			printf '\tchain %s {\n\t\ttype %s hook %s priority %s; policy accept;  # %s\n\t}\n' \
+				"$chain" "$type" "$hook" "$prio" "$memo"
+		done <<EOF
+$(_oc_fw4_skeleton_spec)
+EOF
+		printf '}\n'
+	} >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+	# 只在内容变化时替换，避免每次触发 nftables.service reload
+	if [ -f "$out" ] && cmp -s "$tmp" "$out"; then
+		rm -f "$tmp"
+		return 0
+	fi
+	if [ "$OPENCLASH_RT_DRY_RUN" = "1" ]; then
+		cat "$tmp"
+		rm -f "$tmp"
+		return 0
+	fi
+	mv -f "$tmp" "$out" 2>/dev/null && chmod 0644 "$out" 2>/dev/null
+	return 0
+}
+
+# --- include 脚本执行（§2.3.5） ---------------------------------------------
+
+_oc_fw4_uci() {
+	if [ -n "${OPENCLASH_RT_UCI:-}" ]; then
+		"$OPENCLASH_RT_UCI" "$@"
+		return $?
+	fi
+	local p
+	for p in /sbin/uci /usr/sbin/uci /usr/bin/uci; do
+		[ -x "$p" ] && "$p" "$@" && return $?
+	done
+	uci "$@" 2>/dev/null
+}
+
+_oc_fw4_run_includes() {
+	local line sec type path rc=0 ran=0
+
+	line="$(_oc_fw4_uci -q show firewall 2>/dev/null | grep '=include$')" || true
+	[ -z "$line" ] && return 0
+
+	while IFS= read -r entry; do
+		[ -z "$entry" ] && continue
+		sec="${entry%%=*}"
+		type="$(_oc_fw4_uci -q get "$sec.type" 2>/dev/null)" || true
+		path="$(_oc_fw4_uci -q get "$sec.path" 2>/dev/null)" || true
+		[ "$type" = "script" ] || continue
+		[ -n "$path" ] || continue
+		if [ ! -e "$path" ]; then
+			_oc_fw4_log "include 脚本不存在，跳过: $path"
+			continue
+		fi
+		if [ ! -x "$path" ]; then
+			_oc_fw4_err "include 脚本不可执行: $path"
+			rc=1
+			continue
+		fi
+		_oc_fw4_log "执行 include 脚本: $path"
+		ran=$((ran + 1))
+		if [ "$OPENCLASH_RT_DRY_RUN" = "1" ]; then
+			continue
+		fi
+		"$path" || { _oc_fw4_err "include 脚本失败: $path"; rc=1; }
+	done <<EOF
+$line
+EOF
+
+	[ "$ran" -eq 0 ] && _oc_fw4_log "没有 include 脚本需要执行"
+	return "$rc"
+}
+
+# --- 子命令 -----------------------------------------------------------------
+
+cmd_check() {
+	_oc_fw4_assert_skeleton
+}
+
+cmd_reload() {
+	_oc_fw4_assert_skeleton || return $?
+	_oc_fw4_persist_skeleton
+	_oc_fw4_run_includes
+	local rc=$?
+	_oc_fw4_log "fw4 reload 完成"
+	return "$rc"
+}
+
+cmd_status() {
+	if [ -z "$NFT" ]; then
+		_oc_fw4_err "找不到 nft"
+		return 127
+	fi
+	if ! _oc_fw4_has_table; then
+		_oc_fw4_err "表 $RT_FAMILY $RT_TABLE 不存在"
+		return 1
+	fi
+	if [ "$OPENCLASH_RT_DRY_RUN" = "1" ]; then
+		_oc_fw4_log "[dry-run] nft list table $RT_FAMILY $RT_TABLE"
+		return 0
+	fi
+	"$NFT" list table "$RT_FAMILY" "$RT_TABLE"
+}
+
+cmd_stop() {
+	_oc_fw4_has_table || return 0
+	_oc_fw4_nft "delete table $RT_FAMILY $RT_TABLE" || return 1
+	_oc_fw4_log "已删除表 $RT_FAMILY $RT_TABLE（注意：OpenClash 规则一并消失）"
+}
+
+cmd_flush() {
+	_oc_fw4_assert_skeleton
+}
+
+cmd_dry_run() {
+	local saved="$OPENCLASH_RT_DRY_RUN"
+	OPENCLASH_RT_DRY_RUN=1
+	OPENCLASH_RT_QUIET=""
+	_oc_fw4_assert_skeleton
+	printf '\n# ---- 落盘骨架 ----\n'
+	_oc_fw4_persist_skeleton
+	printf '\n# ---- include 脚本 ----\n'
+	_oc_fw4_run_includes
+	printf '\n# ---- reload 流程 ----\n'
+	_oc_fw4_skeleton_spec >/dev/null
+	OPENCLASH_RT_DRY_RUN="$saved"
+	return 0
+}
+
+usage() {
+	cat <<'USAGE'
+fw4 (openclash-rt 兼容垫片) —— 维护 table inet fw4 的骨架
+
+用法:
+  fw4                检查并建立骨架（等价 check）
+  fw4 check          幂等断言骨架；退出码 0 表示就绪
+  fw4 reload         断言骨架 + 落盘 + 执行 firewall.*=include 脚本
+  fw4 restart        同 reload
+  fw4 status|print   打印 table inet fw4
+  fw4 flush          同 check（不删除上游规则）
+  fw4 stop           删除整张表（危险，仅供卸载/排障）
+  fw4 dry-run        只打印将要执行的语句，不修改系统
+  fw4 help           本帮助
+
+说明:
+  上游 OpenClash 只往 table inet fw4 插规则，从不建表。
+  本垫片让 `command -v fw4` 成功，从而让上游稳定走 nft 路径
+  （否则会静默降级到 iptables/ipset 路径）。
+USAGE
+}
+
+main() {
+	local action="${1:-check}"
+	case "$action" in
+		check|"")	cmd_check ;;
+		reload|restart)	cmd_reload ;;
+		status|print|list)	cmd_status ;;
+		flush)		cmd_flush ;;
+		stop)		cmd_stop ;;
+		dry-run|dryrun)	cmd_dry_run ;;
+		help|-h|--help)	usage; return 0 ;;
+		*)
+			_oc_fw4_err "未知子命令: $action"
+			usage >&2
+			return 2
+			;;
+	esac
+}
+
+main "$@"

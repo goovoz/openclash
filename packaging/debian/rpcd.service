@@ -1,0 +1,37 @@
+[Unit]
+Description=OpenWrt ubus RPC backend server (openclash-rt)
+Documentation=https://git.openwrt.org/project/rpcd.git
+Documentation=https://github.com/vernesong/OpenClash
+# rpcd 是 ubusd 的**客户端**（它连 ubusd 并注册 session / uci 两个对象），
+# 所以必须在 ubusd 之后启动，且 ubusd 挂了它也没有意义。
+After=ubusd.service
+Requires=ubusd.service
+# openclash.service 里的上游脚本会调 luci.model.uci → util.ubus("uci", ...)，
+# 而 uci 对象由 rpcd 提供。顺序反了的话，首次启动时上游脚本会拿到
+# "Unable to establish ubus connection"（util.ubus 里的 assert 是硬失败）。
+Before=openclash.service
+
+[Service]
+Type=simple
+# 不带参数即可：main.c 的 -s 未指定时 libubus 用编译期默认 socket，
+# 与 ubusd 的 UBUS_UNIX_SOCKET 是同一个值。
+ExecStart=/usr/sbin/rpcd
+Restart=always
+RestartSec=5
+
+# rpcd 会在 /var/run/rpcd 下放 uci 暂存区与快照（include/rpcd/uci.h:33）。
+# 它自己会 mkdir(0700)（main.c:99），但显式声明能让 systemd 在
+# ProtectSystem 之类的加固策略下也不出问题，并在重启时自动清空。
+RuntimeDirectory=rpcd
+RuntimeDirectoryMode=0700
+
+# 说明：本包**不安装**任何 rpcd 插件（/usr/lib/rpcd/*.so）。
+#   file / rpcsys / iwinfo / ucode 四个插件要么依赖 Debian 上不存在的库
+#   （libiwinfo、libucode），要么只服务 cgi-io（上游 OpenClash 零引用）。
+#   我们需要的 session 与 uci **编译在 rpcd 主程序内**，不是插件。
+#   详见 docs/04-ubus依赖图谱.md §4.1 与 runtime/ubus/build-ubus.sh 的注释。
+#   因此 /usr/libexec/rpcd 目录在本包内是空的（由 OpenClash 的 P2 阶段
+#   放入 LuCI 的 luci 插件脚本）。opendir 失败不影响 rpcd 启动。
+
+[Install]
+WantedBy=multi-user.target

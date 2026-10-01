@@ -1,0 +1,217 @@
+#!/bin/sh
+# openclash-rt postinst
+set -e
+
+PKG="openclash-rt"
+
+log() { echo "$PKG: $*"; }
+
+case "${1:-}" in
+	configure)
+		# ---- 工作目录（对应 OpenWrt 上由 ipk 创建的结构） ----------------
+		for d in \
+			/etc/openclash \
+			/etc/openclash/config \
+			/etc/openclash/core \
+			/etc/openclash/custom \
+			/etc/openclash/overwrite \
+			/etc/openclash/dashboard \
+			/etc/openclash/rule_provider \
+			/etc/openclash/proxy_provider \
+			/etc/openclash/Model \
+			/var/lib/openclash \
+			/var/log/openclash \
+			/run/openclash \
+			/run/openclash/rt
+		do
+			mkdir -p "$d"
+		done
+		chmod 0755 /etc/openclash /var/lib/openclash /var/log/openclash 2>/dev/null || true
+
+		# 上游把 core 放在 /etc/openclash/core/clash_meta，并以 /etc/openclash/clash
+		# 作为软链；core 下载脚本会创建它，这里先建好目录与占位软链避免首次启动报错
+		if [ ! -e /etc/openclash/clash ] && [ -e /etc/openclash/core/clash_meta ]; then
+			ln -sf /etc/openclash/core/clash_meta /etc/openclash/clash
+		fi
+
+		# ---- 动态链接器缓存 ------------------------------------------------
+		# 本包往 /usr/lib 与 /usr/lib/<multiarch> 里放了三个共享库：
+		#   libubox.so / libuci.so        uci 运行时（/sbin/uci 依赖）
+		#   libnl-tiny.so.1               luci.ip 的 DT_NEEDED
+		#
+		# libnl-tiny 最容易被漏掉：它是**我们私有**的库（Debian 自己的
+		# libnl-3 是另一套 API/ABI，不能替代），落在 /usr/lib/<multiarch>/
+		# 下，靠 libc6 提供的 /etc/ld.so.conf.d/<triple>.conf 覆盖到。
+		# 只要 ldconfig 跑过一次就能被找到；漏跑的症状是
+		#   require "luci.ip" → libnl-tiny.so.1: cannot open shared object file
+		# 而这个 .so 是 luci-compat 的 model/network.lua 顶层 require 的，
+		# 于是整个 Web UI 起不来，报错却指向一个用户从没听说过的库名。
+		#
+		# ⚠️ 这里**必须无条件**跑 ldconfig。早期版本把它放在
+		#    "libuci.so 是否存在"的条件分支里，libnl-tiny 只是被顺带照顾到 ——
+		#    一旦 uci 换装到别的目录（或将来拆成独立包），libnl-tiny 就会
+		#    静默失效，而且本机装过 uci 的开发机上永远复现不出来。
+		#
+		# /usr/lib 这一段是必要的：libuci.so / libubox.so 装在 /usr/lib，
+		# 而 Debian 的 /etc/ld.so.conf.d/<triple>.conf 只列了
+		# /lib/<triple> 与 /usr/lib/<triple>，**不含** /usr/lib 本身。
+		# （不能用 `ls a* b*` 去判定要不要写：多操作数时只要有一个 glob
+		#   没匹配上，ls 就返回非零，条件会随机失效。直接写即可，幂等。）
+		echo "/usr/lib" >/etc/ld.so.conf.d/openclash-rt.conf
+		if command -v ldconfig >/dev/null 2>&1; then
+			ldconfig 2>/dev/null || log "ldconfig 失败，luci.ip 可能加载不了"
+		fi
+
+		# ---- 让 /sbin/uci 可达（上游 uci_load 硬编码该路径）---------------
+		# 三种情形必须分开处理，不能只写 `[ ! -e /sbin/uci ] && ln -s ...`：
+		#
+		#   a) usrmerge（Debian 12+ / Ubuntu 24.04 默认）：/sbin 本身就是指向
+		#      usr/sbin 的软链，于是 /sbin/uci 与 /usr/sbin/uci **是同一个文件**。
+		#      此时若还去 `ln -sf /usr/sbin/uci /sbin/uci`，等于在一个路径上创建
+		#      指向它自己的链接：GNU ln 会报 "'x' and 'x' are the same file" 并
+		#      返回非零，在 set -e 下**直接让 postinst 失败**（dpkg 报配置错误）。
+		#      故 usrmerge 下必须什么都不做。
+		#      判定用 `[ /sbin -ef /usr/sbin ]`（比较 inode），而不是看
+		#      `readlink /sbin`：/sbin 可能是真实目录也可能是软链，inode 相同
+		#      才是"同一目录"的充分条件。
+		#
+		#   b) 非 usrmerge 且 /sbin/uci 缺失：补一个软链，并写**标记文件**记下它
+		#      指向谁。标记文件是卸载端的所有权凭据 —— 见 prerm / postrm。
+		#
+		#   c) /sbin/uci 已存在（真实文件，或指向别处的软链）：**一律不动**，
+		#      只告警。它可能属于别的包。旧实现确实也用 `[ ! -e ]` 做了守卫，
+		#      但 postrm 里另有一句无条件的 `rm -f /sbin/uci` —— 于是总体行为
+		#      是"不建、但会删"，正是那种能让用户丢失别人文件的组合。见 postrm。
+		UCI_REAL=""
+		for _c in /usr/sbin/uci /usr/bin/uci; do
+			if [ -x "$_c" ]; then UCI_REAL="$_c"; break; fi
+		done
+		SBIN_UCI_MARK=/usr/lib/openclash-rt/.sbin-uci-created
+		if [ -z "$UCI_REAL" ]; then
+			log "警告：找不到 uci 可执行文件，/sbin/uci 无法补齐（上游脚本将无法读写配置）"
+		elif [ ! -d /sbin ]; then
+			log "警告：/sbin 不是目录，跳过 /sbin/uci 补齐"
+		elif [ /sbin -ef /usr/sbin ]; then
+			: # usrmerge：两路径是同一文件，无需也不能再建链接
+		elif [ -L /sbin/uci ]; then
+			case "$(readlink /sbin/uci 2>/dev/null)" in
+				"$UCI_REAL")
+					# 本包此前建过（重装/升级）：补写标记，保持卸载端可判
+					mkdir -p /usr/lib/openclash-rt 2>/dev/null || true
+					printf '%s\n' "$UCI_REAL" >"$SBIN_UCI_MARK" 2>/dev/null || true
+					;;
+				*)
+					log "警告：/sbin/uci 已存在且指向 $(readlink /sbin/uci 2>/dev/null)，本包不覆盖它"
+					;;
+			esac
+		elif [ -e /sbin/uci ]; then
+			log "警告：/sbin/uci 已存在且非本包创建，本包不覆盖它"
+		else
+			if ln -s "$UCI_REAL" /sbin/uci; then
+				mkdir -p /usr/lib/openclash-rt 2>/dev/null || true
+				# 标记写失败不影响功能，只是卸载端会保守地不清理（留下一个多余
+				# 软链，总好过删掉别人的文件），故这里只提示、不失败。
+				printf '%s\n' "$UCI_REAL" >"$SBIN_UCI_MARK" 2>/dev/null || \
+					log "提示：未能写标记 $SBIN_UCI_MARK，卸载时不会清理 /sbin/uci"
+			else
+				log "创建 /sbin/uci 失败，上游脚本可能找不到 uci"
+			fi
+		fi
+
+		# ---- /etc/openwrt_release 复核 ------------------------------------
+		# 这个文件有两处硬依赖，任一错都会静默降级：
+		#   a) init.d:14 用它的**存在性**门控 DNSMASQ_CONF_DIR 推导
+		#   b) uci-defaults:79-124 source 它，用 DISTRIB_ARCH 推内核架构
+		# 包内已按构建架构生成一份；这里再以**本机实际架构**复核一次，
+		# 覆盖「跨架构安装 / 换机器 / 用户手工改过」三种情况。
+		# 必须放在执行 uci-defaults 之前 —— 后者要读 DISTRIB_ARCH。
+		if [ -x /usr/lib/openclash-rt/openwrt-release.sh ]; then
+			if ! /usr/lib/openclash-rt/openwrt-release.sh --check >/dev/null 2>&1; then
+				log "刷新 /etc/openwrt_release（与本机架构不一致）"
+				/usr/lib/openclash-rt/openwrt-release.sh >/dev/null 2>&1 || \
+					log "openwrt-release 生成失败，内核架构可能被判为 0"
+			fi
+		fi
+
+		# ---- 首次安装：执行上游 uci-defaults ------------------------------
+		# 上游 uci-defaults 会写出 authentication 段、并按 DISTRIB_ARCH 推导
+		# core_version。这里仅在配置里还没有 authentication 段时执行一次。
+		# 优先 /sbin/uci（上游硬编码路径），否则退回前面探测到的真实路径。
+		# 用 UCI_REAL 而不是写死 /usr/sbin/uci：如果 uci 的 make install 把它
+		# 放在 /usr/bin（build-deb.sh 已考虑这种情况并会补 /usr/sbin 软链，但
+		# 若那一步被跳过），写死路径会让 uci-defaults 静默不执行。
+		UCI_BIN=/sbin/uci
+		[ -x "$UCI_BIN" ] || UCI_BIN="${UCI_REAL:-/usr/sbin/uci}"
+		if [ -x /usr/share/openclash/uci-defaults/luci-openclash ]; then
+			if ! "$UCI_BIN" -q get openclash.@authentication[0] >/dev/null 2>&1; then
+				log "running upstream uci-defaults"
+				sh /usr/share/openclash/uci-defaults/luci-openclash >/dev/null 2>&1 || \
+					log "uci-defaults 返回非零（可忽略，可稍后从 Web UI 触发）"
+			fi
+		fi
+
+		# ---- 补齐上游假定存在的前提（与 openclash.service 的 ExecStartPre 一致）----
+		# 安装后立即做一次，避免用户手工 systemctl start 之前的状态不可用。
+		if [ -x /usr/lib/openclash-rt/prepare-tmp.sh ]; then
+			/usr/lib/openclash-rt/prepare-tmp.sh >/dev/null 2>&1 || \
+				log "prepare-tmp 返回非零（可稍后重试：/usr/lib/openclash-rt/prepare-tmp.sh）"
+		fi
+		if [ -x /usr/sbin/fw4 ]; then
+			/usr/sbin/fw4 check >/dev/null 2>&1 || \
+				log "fw4 骨架未建立（通常是 nftables 未安装），OpenClash 将无法使用 nft 分流"
+		fi
+
+		# ---- systemd -------------------------------------------------------
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl daemon-reload >/dev/null 2>&1 || true
+
+			# ubus 底座必须先起来：ubusd 是消息总线本体，rpcd 在它之上提供
+			# session 与 uci 两个对象（这也是 luci.model.uci 唯一的读写通路，
+			# 见 vendor/rpcd/main.c:117-119）。
+			#
+			# ⚠️ 不能只依赖 openclash.service 的 Wants=ubusd rpcd 按需拉起：
+			#    上游 8 个 #!/usr/bin/lua5.1 脚本、以及 cron 里的
+			#    openclash_watchdog，会在**任意时刻**用 ubus/uci 读写配置 ——
+			#    那时 openclash.service 可能根本没在跑。总线不在时的症状是
+			#    luci.model.uci 抛出 "Connection failed"
+			#    （该字符串就列在 model/uci.lua 的 ERRSTR 表里），
+			#    而报错位置离"服务没启用"这件事很远，很难查。
+			#
+			# 顺序交给 systemd：rpcd.service 里写了 Requires=ubusd.service，
+			# 所以同时 enable 两个是安全的。
+			if [ -f /lib/systemd/system/ubusd.service ] && [ -f /lib/systemd/system/rpcd.service ]; then
+				systemctl enable --now ubusd.service rpcd.service >/dev/null 2>&1 || \
+					log "启用 ubusd/rpcd 失败，可手动执行： systemctl enable --now ubusd rpcd"
+			else
+				log "警告：ubusd/rpcd 单元文件缺失，前端与上游 Lua 脚本将无法读写配置"
+			fi
+
+			# 是否随开机启动由上游 option enable 决定（boot() 会自行判断），
+			# 因此这里直接 enable 单元是安全的。
+			# ⚠️ 不能用 `systemctl enable openclash.service`：/etc/init.d/openclash
+			# 与原生单元同名，enable 会先做 SysV 同步（systemd-sysv-install），
+			# 而 init 脚本是 OpenWrt rc.common 风格、无 LSB Default-Start，
+			# update-rc.d 直接 abort → 整个 enable 失败（2026-10-01 真机实测）。
+			# add-wants 只建 /etc/systemd/system/multi-user.target.wants/ 软链，
+			# 不走 sysv 同步，效果等价于 enable 的 WantedBy=multi-user.target。
+			systemctl add-wants multi-user.target openclash.service >/dev/null 2>&1 || \
+				log "开机自启未挂上，可手动执行： systemctl add-wants multi-user.target openclash.service"
+			# 监听 /etc/config/dhcp 变化，把 UCI 翻译成 dnsmasq 配置
+			systemctl enable --now openclash-rt-dnsmasq-sync.path >/dev/null 2>&1 || \
+				log "dnsmasq 同步单元未启用（可手动： systemctl enable --now openclash-rt-dnsmasq-sync.path）"
+		fi
+
+		UPVER="$(sed -n 's/^PKG_VERSION=//p' /usr/lib/openclash-rt/upstream-version 2>/dev/null)"
+		UPCOMMIT="$(sed -n 's/^UPSTREAM_COMMIT=//p' /usr/lib/openclash-rt/upstream-version 2>/dev/null)"
+		log "installed. 上游版本：${UPVER:-未知} (${UPCOMMIT:-未知})"
+		log "启用方式： Web UI 打开 enable 开关，或 uci set openclash.config.enable=1 && systemctl start openclash"
+		;;
+
+	abort-upgrade|abort-remove|abort-deconfigure)
+		;;
+
+	*)
+		;;
+esac
+
+exit 0

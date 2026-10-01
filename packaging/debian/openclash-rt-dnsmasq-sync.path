@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch /etc/config/dhcp for openclash-rt dnsmasq sync
+Documentation=https://github.com/vernesong/OpenClash
+
+[Path]
+# 上游在任何影响 DNS 的操作后都会 `uci -q commit dhcp`，即改写 /etc/config/dhcp。
+# 监听该文件的修改，可以覆盖**所有**写入方（init 脚本、watchdog、Web UI），
+# 不需要去 hook uci 或替换 dnsmasq 的 init 脚本。
+PathModified=/etc/config/dhcp
+Unit=openclash-rt-dnsmasq-sync.service
+
+[Install]
+WantedBy=multi-user.target

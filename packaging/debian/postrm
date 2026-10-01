@@ -1,0 +1,67 @@
+#!/bin/sh
+# openclash-rt postrm
+set -e
+
+cleanup_dnsmasq() {
+	rm -f /etc/dnsmasq.d/00-openclash-rt-uci.conf \
+	      /etc/dnsmasq.d/00-openclash-rt-uci.conf.prev 2>/dev/null || true
+	# 上游直接写到 DNSMASQ_CONF_DIR 的分流片段
+	rm -f /etc/dnsmasq.d/dnsmasq_openclash_*.conf 2>/dev/null || true
+
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl restart dnsmasq >/dev/null 2>&1 || true
+	elif [ -x /etc/init.d/dnsmasq ]; then
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	fi
+}
+
+SBIN_UCI_MARK=/usr/lib/openclash-rt/.sbin-uci-created
+
+# ⚠️ 这里**刻意不做** `rm -f /sbin/uci`（旧实现是这么写的，是个真缺陷）。
+#    原因：/sbin/uci 常常**不是**本包创建的 —— postinst 只在"它不存在"时才补
+#    软链，存在（可能是别的包放的真实 uci）就跳过。于是旧实现的行为是
+#    "不建、但 purge 时会删"：用户 purge 掉 openclash-rt 之后，另一个工具的
+#    uci 命令凭空消失了。删除动作已经移到 prerm（在那里才能读到所有权标记）。
+#    postrm 只负责清掉标记文件本身，以及兜底处理"prerm 因故没跑成"的残留。
+rm_sbin_uci_if_ours() {
+	[ -f "$SBIN_UCI_MARK" ] || return 0
+	[ -L /sbin/uci ] || return 0
+	_want="$(cat "$SBIN_UCI_MARK" 2>/dev/null || true)"
+	[ -n "$_want" ] || return 0
+	[ "$(readlink /sbin/uci 2>/dev/null || true)" = "$_want" ] || return 0
+	rm -f /sbin/uci 2>/dev/null || true
+}
+
+case "${1:-}" in
+	purge)
+		# purge 时清掉运行时残留与配置（用户数据目录 /etc/openclash 下的
+		# 订阅与节点配置属于敏感数据，默认保留，仅在 purge 时提示）
+		rm -rf /run/openclash 2>/dev/null || true
+		rm -f /etc/ld.so.conf.d/openclash-rt.conf 2>/dev/null || true
+		# 兜底：正常情况下 prerm 已经清理过；这里再走一次是为了覆盖
+		# "postinst 成功建链、但 prerm 没执行到"的异常路径（幂等，无害）。
+		rm_sbin_uci_if_ours
+		# 标记文件是 postinst 写的，不在 dpkg 文件清单里，必须自己清，
+		# 否则目录清理不掉、且下次安装会读到过期凭据。
+		rm -f "$SBIN_UCI_MARK" 2>/dev/null || true
+		rmdir /usr/lib/openclash-rt 2>/dev/null || true
+		cleanup_dnsmasq
+		ldconfig 2>/dev/null || true
+		echo "openclash-rt: /etc/openclash 下的订阅与节点配置已保留，如需彻底清理请手动删除。"
+		;;
+
+	remove)
+		rm -rf /run/openclash 2>/dev/null || true
+		rm -f /etc/ld.so.conf.d/openclash-rt.conf 2>/dev/null || true
+		cleanup_dnsmasq
+		ldconfig 2>/dev/null || true
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl daemon-reload >/dev/null 2>&1 || true
+		fi
+		;;
+
+	*)
+		;;
+esac
+
+exit 0
