@@ -183,14 +183,17 @@ LMO_OUT_DIR="$STAGE/usr/lib/lua/luci/i18n"
 mkdir -p "$LMO_OUT_DIR"
 
 # ⚠️ SKIP_CC=1 时 §1 写了占位 po2lmo（exit 1），下面的 .po 循环会全炸。
-#    这里显式跳过 .po 编译，与 §1 占位保持一致。
-if [ "$SKIP_CC" = "1" ]; then
-	log "SKIP_CC=1：跳过 po2lmo 编译与 .po -> .lmo 编译（仅落位与静态检查）"
-	exit 0
-fi
-
+#    这里显式**只**跳过 .po 编译循环，但**必须继续往下跑**：
+#      · 静态断言（.po / .y / .c / .h 不入 staging、落位路径、命名约定）
+#      · 末尾的「i18n 落位总数」总结（build-deb.sh §5d 与 test_luci_lmo_install
+#        的 B 组断言都依赖它）
+#    2026-10-01 修：这里原本是 `exit 0`，把**静态检查一起跳掉**了 —— 注释写着
+#    "仅落位与静态检查"，实际却一行检查都没跑，SKIP_CC 路径等于没验收。
 _count=0
 _count_failed=0
+if [ "$SKIP_CC" = "1" ]; then
+	log "SKIP_CC=1：跳过 po2lmo 编译与 .po -> .lmo 编译（仅落位与静态检查）"
+else
 for pkg_po_dir in "$SRC"/*/po; do
 	[ -d "$pkg_po_dir" ] || continue
 	# 从 <src>/<pkg>/po 反推 <pkg>（basename of dirname）
@@ -225,6 +228,7 @@ done
 if [ "$_count_failed" -gt 0 ]; then
 	die "$_count_failed 个 .po 编译失败（详见 $BUILD_DIR/i18n/*.err）"
 fi
+fi  # end of: SKIP_CC != 1 时才编 .po
 
 log ".po -> .lmo 编译完成，共 $_count 个落位（target=$LMO_OUT_DIR）"
 

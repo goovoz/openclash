@@ -76,10 +76,26 @@ printf '\n\033[1mC. 命名约定 & 不变量\033[0m\n'
 # 1) 落位路径必须等于 /usr/lib/lua/luci/i18n/
 _n="$(grep -cF 'usr/lib/lua/luci/i18n' "$LMO_INSTALL")"
 _yeseq "$_n" 1 "C 落位路径含 i18n/"
-# 2) 编译命令只 link po2lmo.c（不引 template_lmo.c）
-chk "C 编译用 cc po2lmo.c" "$(grep -cE 'cc .* po2lmo\.c' "$LMO_INSTALL" || true)" "1"
-not "C 编译**不** link template_lmo.c" "$(cat "$LMO_INSTALL")" "po2lmo.c template_lmo.c"
-not "C 编译**不**引 flex / bison / lemon" "$(cat "$LMO_INSTALL")" "flex | bison | lemon "
+# 2) 编译命令：fallback self-compile 必须链全（po2lmo.c + template_lmo.c …）
+chk "C 编译用 C 编译器编 po2lmo.c" "$(grep -cE '\$CC.*po2lmo\.c' "$LMO_INSTALL" || true)" "1"
+#   ⚠️ 这条断言在 2026-10-01 **翻转过**，原因是早期结论错了：
+#     · 旧断言：not(源码里出现 "po2lmo.c template_lmo.c") —— 假设单文件 cc 就够
+#     · 真机事实：po2lmo.c 引用 template_lmo.c 里的 sfh_hash；单文件 cc 会
+#       `undefined reference to 'sfh_hash'`。fallback **必须**链全，否则 CI
+#       ubuntu-latest 上一个 .po 都编不出来（见 install-vendor-lmo.sh §1 注释）。
+#     · vendor Makefile 印证：po2lmo ← po2lmo.o template_lmo.o plural_formula.o
+#   所以这里改成 has 而不是 not，并把「不该有」的判据移交给下面那条 —— 真正要
+#   守住的是**主路径不重编**，而不是"源码里不许出现这个词"。
+has "C fallback 编译链含 template_lmo.c（sfh_hash 符号来源）" \
+	"$(grep -oE 'po2lmo\.c +[a-z_]*\.c( +[a-z_]*\.c)*' "$LMO_INSTALL" | head -1)" \
+	"po2lmo.c template_lmo.c"
+#   ★ 这条才是「不引 lemon/flex/bison」的**真判据**：主路径必须复用
+#     build-lua-modules.sh §6 已经跑过 lemon 的产物，install-vendor-lmo.sh
+#     自己不再调一遍 lemon（那样会牵出 flex/bison 依赖）。
+#     变异锁：把 --po2lmo 主路径删掉（强制 self-compile）→ 这条立刻红。
+_yeseq "$(grep -cF 'STAGE/usr/bin/po2lmo' "$LMO_INSTALL" || true)" 1 \
+	"C 主路径复用 build-lua-modules.sh §6 的 po2lmo 产物（不自己重编）"
+not "C 主路径**不**自己调 lemon" "$(cat "$LMO_INSTALL")" "contrib/lemon -q"
 # 3) po2lmo 调用约定： argv[1] = .po, argv[2] = .lmo（不能颠倒）
 chk "C po2lmo 调用形态 po->lmo" "$(grep -cF '$_po" "$_lmo"' "$LMO_INSTALL" || true)" "1"
 # 4) 命名约定：必须显式写出 <pkg>.<lang>.lmo 与 fnmatch 模式说明
@@ -89,7 +105,12 @@ chk "C 脚本内文明确写出 <pkg>.<lang>.lmo 命名约定" "$(grep -cF '<pkg
 # --- D. 卫生：.po / .y / .c / .h 不入 staging ---
 printf '\n\033[1mD. 卫生：编译期材料不入 staging\033[0m\n'
 chk "D 静态断言：.po 源不入 staging" "$(grep -cF '.po 源未误入' "$LMO_INSTALL" || true)" "1"
-chk "D 静态断言：.y / .c / .h 不入 staging" "$(grep -cF 'plural_formula' "$LMO_INSTALL" || true)" "1"
+# ⚠️ 这条也翻转过：原本 grep 'plural_formula' 期望 ==1，但实施「fallback 必须
+#   链 plural_formula.c」之后该词在注释/实现里出现 7 次，计数断言失去意义。
+#   改成锚定**真正的静态断言**那一行的判据字符串（find 的 -name 通配），
+#   它只出现在 §4 卫生检查里，复制/改动该 check 就会破坏计数。
+chk "D 静态断言：plural_formula* 不入 staging" \
+	"$(grep -cF -- "-name 'plural_formula*'" "$LMO_INSTALL" || true)" "1"
 chk "D po2lmo 二进制不进 deb（属 build/，§4 清）" "$(grep -cF 'build/ 下' "$LMO_INSTALL" || true)" "1"
 
 # --- E. stdout 纪律（build-deb.sh 用 n="$(...)" 捕获时不应被日志污染） ---
