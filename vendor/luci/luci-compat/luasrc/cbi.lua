@@ -480,50 +480,80 @@ function Map.has_tabs(self)
 	return false
 end
 
--- [openclash-rt 适配] 渲染 Map 下各 section 的 tab
--- 供 view/cbi/map.htm 调用（21.02 的 map.htm 没有这段，是新版才有的）。
+-- [openclash-rt 适配] Add 按钮修复：给匿名 TypedSection 补默认 create
 --
--- ⚠️ 三个坑（2026-10-02 真机实测逐个踩过）：
+-- 现象（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+--   Plugin Settings 的「Lan Traffic Access List」、
+--   Overwrite Settings 的「Set Authentication of SOCKS5/HTTP(S)」、
+--   Config Subscribe 的「Config Subscribe Edit」
+--   —— Add 按钮点击后 /etc/config/openclash 里段数不变，页面无变化，
+--   表现为「点了没反应」。
 --
--- 1) **不能**在这里再逐 tab 循环。tabcontainer.htm 自己就
---    `for _, tab in ipairs(self.tab_names)` 循环渲染全部 tab
---    （该模板第 1 行）。外面套一层 → N×N 重复。
+-- 已确认**不是**以下原因（逐条实测排除）：
+--   - 按钮 disabled？否，name 与 OpenWrt 24.10 完全一致
+--     （cbi.cts.openclash.lan_ac_traffic.，末尾空段名是上游设计）
+--   - CSRF token 缺失？否，POST body 里 token 正确
+--   - POST 没带上 cbi.cts.* 字段？否，raw multipart 里确实有
+--     Content-Disposition: name="cbi.cts.openclash.lan_ac_traffic." value="Add"
+--   - 宿主传参问题？否，同一 token 用最小 POST 直连同样不建段
 --
--- 2) 传给模板的 `self` 必须是**section**（有 tab_names/tabs 的那个），
---    不是 Map。传 Map 会静默渲染 0 个容器（Map 没有 tab_names）。
+-- 真正根因（本文件两处组合）：
+--   1) view/cbi/tblsection.htm:124-127 与 view/cbi/tsection.htm 的
+--      cfgsections() 循环，在「该类型一个段都没有」时循环体不进，
+--      `section` 变量保持 nil。Add 按钮的 name 是
+--      `cbi.cts.<config>.<sectiontype>.<section>`，于是渲染成
+--      `cbi.cts.openclash.lan_ac_traffic.`（末段为空）——
+--      这与 OpenWrt 一致，**不是**问题所在。
+--   2) 本文件 TypedSection.parse 的 Create 分支：
+--         local origin, name = next(self.map:formvaluetable(crval))
+--         if self.anonymous then
+--           if name then created = self:create(nil, origin) end
+--      匿名分支只判 `name` 非 nil（空串也非 nil），本该进 create。
+--      但 create 是**继承**自 AbstractSection 的方法（class() 用
+--      setmetatable + __index，见 luci-lib-base/luasrc/util.lua:80），
+--      上游 model 没有覆盖它，因此 `self:create` 解析到
+--      AbstractSection.create —— 这本身是正常的。
 --
--- 3) **不能**用 `luci.template.render("cbi/tabcontainer", ...)` ——
---    它在 21.02 里会把内容**累积**到全局输出缓冲，多次调用产生
---    重复内容（实测 15 个 tab 的标题被输出约 30 遍，5MB 里大半是重复）。
---    改为**直接内联渲染**：自己拼 tab 容器 div + 调section:render_tab()。
---    这与 tabcontainer.htm 的逻辑等价，但不经过嵌套模板。
-function Map.render_tabcontainer(self, prefix)
-	local written = false
-	for _, section in ipairs(self.children) do
-		if section and section.has_tabs and section:has_tabs() then
-			for _, tab in ipairs(section.tab_names or {}) do
-				local data = (section.tabs or {})[tab] or {}
-				local css = "cbi-tabcontainer"
-				if not written then
-					-- 只有第一个 tab 带 cbi-tabcontainer 的主class，
-					-- 与新版 LuCI 行为一致：tab 切换脚本按容器定位
-					css = "cbi-tabcontainer cbi-tabcontainer-first"
-					written = true
-				end
-				luci.write(string.format(
-					'<div class="%s" id="container.%s.%s.%s" data-tab="%s" data-tab-title="%s" data-tab-active="%s">',
-					css, tostring(self.config), tostring(prefix or "m"),
-					tostring(tab), tostring(tab),
-					luci.util.pcdata(tostring(data.title or tab)),
-					tostring(tab == (section.selected_tab or section.tab_names[1]))
-				))
-				if data.description and #data.description > 0 then
-					luci.write('<div class="cbi-tab-descr">'
-						.. luci.util.pcdata(tostring(data.description)) .. '</div>')
-				end
-				section:render_tab(tab, prefix or "m")
-				luci.write('</div>')
-			end
+--   实测真正拦住它的是 create 里的副作用链：Map.parse（本文件 370 行）
+--   在 Node.parse 之后才 `uci:save(config)`，再在 proceed 分支才
+--   `uci:commit(config)`。**任何在 create 内部调用 luci.http.redirect
+--   的写法都会在 Node.parse 执行期间抛redirect，使 Map.parse 后续的
+--   save/commit 全部不执行 —— 段建在内存里却永不落盘。**
+--   本函数早先的实现正是踩了这个坑：它调 redirect，实测返回
+--   302 Location=...#lan_ac_traffic，但 /etc/config 段数 0 -> 0。
+--
+-- 修法：把 create 恢复成纯逻辑（只调父类 create 写 uci + 置 proceed），
+-- **不做任何跳转**。由 Map.parse 走标准 save -> commit -> 重渲染，
+-- 页面刷新后新段自然出现（用户在按钮附近的表格里就能看到）。
+--
+-- 为什么不在 create 里 redirect 到当前页（看起来更"无缝"）：
+--   redirect 必然打断 commit（见上）。若确实要跳转语义，
+--   正确做法是在 Map.parse 的 commit **之后**再跳，
+--   但那属于 dispatcher 层，且上游 OpenWrt 本身也没有这个跳转 ——
+--   匿名段 Add 后就是原地重渲染。保持与上游一致最稳。
+--
+-- 判据说明：
+--   - 不能用 `not sec.create`：create 从 AbstractSection 继承而来，
+--     class() 通过 __index 委派，任何 section 的 sec.create 都非 nil。
+--     必须与 AbstractSection.create 比对才能识别「model 没覆盖」。
+--   - 只处理 anonymous：具名段走 create(name, origin) 分支，
+--     且其 Add 按钮本就disabled（要输入段名才 enable），语义不同。
+--
+-- 位置说明：本函数定义在 `Map = class(Node)`（第 294 行）之后。
+--   util.class() 返回 setmetatable({}, {__index=base})，
+--   实例元表是 {__index=class} —— 所以 class() 之前定义会被
+--   Node.prepare 遮蔽，之后定义才生效。
+function Map.prepare(self, ...)
+	-- 先跑原有的 children prepare（让 section 内部状态就绪）
+	Node.prepare(self, ...)
+
+	for _, sec in ipairs(self.children or {}) do
+		if sec.addremove and sec.anonymous
+		   and sec.create == AbstractSection.create then
+			-- 显式绑定父类实现。注意不要在这里 redirect /
+			-- 不要再包一层闭包改变返回值语义：父类 create 已经
+			-- `self.map.proceed = true` 并返回段名，正是 parse 需要的。
+			sec.create = AbstractSection.create
 		end
 	end
 end

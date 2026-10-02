@@ -28,7 +28,32 @@ end
 local cursor = uci_mod.cursor()
 
 -- -----------------------------------------------------------------------------
--- get(config, section?, option?) → { values } 或 { value }
+-- get(config, section?, option?[, type?]) → { values } 或 { value }
+--
+-- 【重要】必须**保留** libuci 的元字段（.name / .type / .anonymous / .index）。
+--
+-- 起因（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+-- Add 按钮点了没反应。逐层定位发现段其实**建出来了**（uci delta 里有），
+-- 但页面不渲染新段。对照 ImmortalWrt 24.10（172.20.0.2）点同一个按钮，
+-- 新段 cfg2a8d41 立即出现在页面里。
+--
+-- 差异在 luci.model.uci 的 foreach（vendor/luci-base/luasrc/model/uci.lua:245），
+-- 它靠 `get` 返回的 section 表里的元字段工作：
+--     section[".index"] = section[".index"] or index   -- 排序
+--     callback(section) -> section[".name"]            -- 取段名
+-- 而 TypedSection.cfgsections（cbi.lua:1268）进一步：
+--     self.map.uci:foreach(config, sectiontype, function(section)
+--         if self:checkscope(section[".name"]) then
+--             table.insert(sections, section[".name"])
+--
+-- 本实现原先在每个 section 上执行 `if not k:match("^%.") then clean[k] = v`，
+-- 把 .name/.type/.index **全部剥掉** -> foreach 的回调里 section[".name"]
+-- 恒为 nil -> checkscope(nil) 不通过 -> 段被静默过滤 -> 表里不出现新段。
+-- 用户观感就是「Add 点了没反应」。
+--
+-- 同时补上 `type` 过滤参数：foreach 会传 `{config=..., type=stype}`，
+-- 原实现忽略 type，导致按类型枚举也拿不到正确集合（虽然对 openclash
+-- 这种单type config 影响不大，但 get_first / get_all 依赖它）。
 -- -----------------------------------------------------------------------------
 local function op_get(data)
 	local config = data.config
@@ -47,26 +72,22 @@ local function op_get(data)
 			-- 单 section
 			local ok, all = pcall(cursor.get_all, cursor, config, data.section)
 			if ok and type(all) == "table" then
-				-- 去掉元字段（.name/.type/.anonymous/.index）
-				local clean = {}
-				for k, v in pairs(all) do
-					if not k:match("^%.") then clean[k] = v end
-				end
-				return { values = clean }
+				-- 原样返回（含 .name/.type/.anonymous/.index），
+				-- 与 rpcd uci.c rpc_uci_getcommon 的 section 语义一致。
+				return { values = all }
 			end
 		end
 	else
-		-- 整个 config
+		-- 整个 config（可按 type 过滤）
 		local ok, all = pcall(cursor.get_all, cursor, config)
 		if ok and type(all) == "table" then
 			local values = {}
 			for section, opts in pairs(all) do
 				if type(opts) == "table" then
-					local clean = {}
-					for k, v in pairs(opts) do
-						if not k:match("^%.") then clean[k] = v end
+					if not data.type or opts[".type"] == data.type then
+						-- 原样返回，保留元字段（见上方注释）
+						values[section] = opts
 					end
-					values[section] = clean
 				end
 			end
 			return { values = values }
