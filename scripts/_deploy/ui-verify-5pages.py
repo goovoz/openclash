@@ -22,8 +22,8 @@ from credentials import DEBIAN_URL, DEBIAN_PWD, DEBIAN_USER, SEL_DEBIAN
 #       本来就没有 "This section contains no values yet" 之外的 section-node，
 #       故对这两页不做该项判据。
 PAGES = [
-    ("settings",         "Plugin Settings",      15, 200, True),
-    ("config-overwrite", "Overwrite Settings",    5, 300, True),
+    ("settings",         "Plugin Settings",      15, 120, True),
+    ("config-overwrite", "Overwrite Settings",    5,  45, True),
     ("config-subscribe", "Config Subscribe",      0,   1, False),
     ("config",           "Config Manage",         0,  10, False),
     ("log",              "Server Logs",           0,   1, False),
@@ -48,7 +48,12 @@ def fetch(opener, slug):
 def analyse(name, html):
     tabs = re.findall(r'data-tab-title="([^"]*)"', html)
     uniq = sorted(set(tabs))
-    ctrls = len(re.findall(r'type="checkbox"|type="text"|<select', html))
+    # 控件计数：21.02 世代用 class="cbi-value" 容器（每个可设置项一个），
+    # 旧式写法是 <select>/type=checkbox。两者都算，取较大值 ——
+    # 只数 <select 会严重低估（实测 settings 页 select=1 而 cbi-value=145）。
+    ctrls_v = len(re.findall(r'class="cbi-value"', html))
+    ctrls_legacy = len(re.findall(r'type="checkbox"|type="text"|<select', html))
+    ctrls = max(ctrls_v, ctrls_legacy)
     err500 = "500 Internal Server Error" in html or "Failed to execute template" in html
     return {
         "size": len(html),

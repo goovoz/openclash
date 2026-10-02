@@ -10,7 +10,53 @@
 	<% if self.description and #self.description > 0 then -%>
 		<div class="cbi-section-descr"><%=self.description%></div>
 	<%- end %>
-	<% local isempty = true for i, k in ipairs(self:cfgsections()) do -%>
+	<!--
+		[openclash-rt 适配] 带 tab 的 section 绕过 cfgsections()
+
+		背景（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+		OpenClash 的 Plugin Settings 页 15 个 tab 一个都不渲染，只剩
+		「Lan Traffic Access List」+ 2 处 "This section contains no values yet"。
+		对照 ImmortalWrt 24.10（172.20.0.2）同页正常（15 tab / 279 控件）。
+		完整诊断见 docs/09-tab渲染缺陷.md。
+
+		原版第 13 行的循环体是 `for i, k in ipairs(self:cfgsections())`，
+		而 21.02 的 TypedSection.cfgsections（cbi.lua:1148）走
+		`uci:foreach(config, sectiontype, ...)` + `self:checkscope(...)`。
+		对**匿名** TypedSection（settings.lua:66 设了 s.anonymous = true）
+		它返回空表 → 循环体一次都不进。
+
+		但 tab 本身是完好的：s:tab() 15 次调用都成功、选项都在
+		s.tabs[tab].childs 里（cbi.lua:931 / 963 的 taboption）。
+		也就是说数据在，只是没人去取。
+
+		所以这里：当 cfgsections() 为空、但 section 带 tabs 时，
+		直接用 tab_names 当作 section 名单走一遍，
+		让下游的 cbi/ucisection（其第 13 行 `if self.tabs then`
+		include cbi/tabcontainer）正常渲染全部 tab。
+
+		为什么不改 cbi.lua 的 cfgsections：那属于 21.02 的核心逻辑，
+		NamedSection 的多段展开也走它，改动面比本方案大；
+		而本方案只影响「带 tab 且 cfgsections 为空」这一种情形，
+		其它 section 走原路径不变。
+	-->
+	<% local _oc_sections = self:cfgsections()
+	   if #_oc_sections == 0 and self.tabs then
+	      -- 带 tab 但取不到配置段：补一个占位段名，让循环体只跑**一次**。
+	      --
+	      -- 关键（2026-10-02 真机实测踩过）：这里补的是「段名」，
+	      -- 而下游 cbi/ucisection 遇到 self.tabs 时会 include
+	      -- cbi/tabcontainer —— 后者内部自己就 for _, tab in ipairs(self.tab_names)
+	      -- 渲染**全部** tab。所以本循环必须只跑一次；
+	      -- 若把 tab_names 逐个塞进 _oc_sections（N 次循环），
+	      -- 就会 N×N 重复（实测 settings 15×15=225 个容器、
+	      -- overwrite 5×5=25 个）。
+	      --
+	      -- 占位值用 self.sectiontype（"openclash"）。它只作为
+	      -- section-node 的 id 后缀与 addremove 的 name，
+	      -- 匿名段本就不显示段标题、也不需要 Add 按钮，故不影响语义。
+	      table.insert(_oc_sections, self.sectiontype or "cfg")
+	   end -%>
+	<% local isempty = true for i, k in ipairs(_oc_sections) do -%>
 		<% if self.addremove then -%>
 			<div class="cbi-section-remove right">
 				<input type="submit" name="cbi.rts.<%=self.config%>.<%=k%>" onclick="this.form.cbi_state='del-section'; return true" value="<%:Delete%>" class="btn cbi-button" />
