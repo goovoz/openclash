@@ -1,6 +1,6 @@
 # 09 · CBI tab 渲染缺陷（Plugin Settings 全空 / 重复串页）
 
-> 状态：根因已定位，修复方案待实施
+> 状态：**已修复**（方案 B，commit 1f4a07f，2026-10-02）
 > 日期：2026-10-02
 > 真机：Debian 12 @ 172.20.0.101:9080（openclash-rt 0.47.156+ocrt1）
 > 对照：ImmortalWrt 24.10 @ 172.20.0.2（root/DAM%ms7f）
@@ -92,9 +92,17 @@ self.map.uci:foreach(self.map.config, self.sectiontype,
    `map.htm:13: unexpected symbol near '-'`（500）。
    → 教训：LuCI 模板注释块内不要放模板定界符，注释用 HTML `<!-- -->`。
 
-## 5. 待实施方案（三个选项）
+## 5. 方案实施结果
 
-### 方案 A：给 `TypedSection.cfgsections` 补匿名段支持（最小改动，推荐）
+### 方案 A：给 `TypedSection.cfgsections` 补匿名段支持 —❌ 已试，无效
+补了匿名段返回后，页面字节数**完全不变**（24049B），探针确认
+`cfgsections` / `tsection` / `Node.render` 都没被调用 ——
+CBI 渲染根本没走我以为的那条链。**已回滚。**
+
+### 方案 B：给 `tsection.htm` 加 tabbed 兜底分支 — ✅ **生效，采用**
+见下方「§7 已实施的修复」。
+
+### 未采用的两个
 `s.anonymous = true` 时，`cfgsections()` 应直接返回 `{"cfg"}`（匿名段
 在 uci 里的键是 sectiontype 本身），而不是走 `uci:foreach` 筛选。
 改 1 处，风险最低，且不新增 Map 层逻辑。
