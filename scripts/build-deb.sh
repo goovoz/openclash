@@ -310,6 +310,9 @@ cp "$ROOT/runtime/shell/config/uci.sh"        "$STAGE/lib/config/uci.sh"
 
 # 2b) fw4 垫片 —— 必须落在 PATH 上，上游用 `command -v fw4` 做 nft/iptables 二选一
 install -m 0755 "$ROOT/runtime/net/fw4"                "$STAGE/usr/sbin/fw4"
+# 2b2) jsonfilter 垫片 —— OpenWrt 专有 JSON 工具，上游 3 个脚本用（内核版本/
+#      ubus 运行态解析），Debian 没有；用 jq 等价桥接（见 docs/07 §4）。
+install -m 0755 "$ROOT/runtime/net/jsonfilter"         "$STAGE/usr/bin/jsonfilter"
 # 2c) 易失路径准备 + dnsmasq 适配器（Debian 上没有任何组件会创建这些前提）
 install -m 0755 "$ROOT/runtime/net/prepare-tmp.sh"     "$STAGE/usr/lib/openclash-rt/prepare-tmp.sh"
 install -m 0755 "$ROOT/runtime/net/dnsmasq-adapter.sh" "$STAGE/usr/lib/openclash-rt/dnsmasq-adapter.sh"

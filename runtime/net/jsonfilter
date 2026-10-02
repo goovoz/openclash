@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# =============================================================================
+# openclash-rt  jsonfilter 兼容垫片（OpenWrt 专有工具 → Debian jq 桥接）
+# -----------------------------------------------------------------------------
+# 上游 OpenClash 3 个脚本用 jsonfilter 解析 JSON（OpenWrt 内置工具，Debian 没有）：
+#   openclash_core.sh:59/61/63    内核版本号解析
+#   openclash_update.sh:35/442    插件版本 + ubus 运行态
+#   openclash_watchdog.sh:211     ubus 运行态
+#
+# 本垫片用 Debian 已依赖的 jq 等价实现 jsonfilter 的**最小子集**——只覆盖上游
+# 实际用到的表达式形态（2026-10-02 全量 grep 确认，无过滤/无下标/无 union）：
+#
+#   A) jsonfilter -i FILE -e '@.master.latest.core_meta'           → 提取标量
+#   B) ubus call ... | jsonfilter -e '@.openclash.instances.*.running' → stdin 提取
+#
+# 映射规则：
+#   @        → 去掉（根标记）
+#   .a.b.c   → .a.b.c         （路径不变，jq 语法兼容）
+#   .*       → []?            （一层通配；jq 里 [] 是数组遍历、? 是容错，
+#                                OpenWrt jsonfilter 的 * 是"任意一层键/元素"，
+#                                ubus 对象名层用 []? 等价）
+#   带横杠的键（上游未用，但 jsonfilter 语法支持）→ jq 的 ."a-b"
+#
+# 用法：
+#   jsonfilter -i FILE -e '@.a.b.c'
+#   echo '{"a":1}' | jsonfilter -e '@.a'
+#
+# 环境变量：
+#   OPENCLASH_RT_QUIET  置 1 时不打印解析失败日志（-q 同义）
+# =============================================================================
+set -u
+
+Q=
+A=
+INFILE=
+EXPRS=()
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-q) Q=1 ;;
+		-a) A=1 ;;
+		-i) INFILE="${2:?jsonfilter: -i 需要文件}"; shift ;;
+		-s) printf 'jsonfilter: -s 字符串输入未实现（上游未用）\n' >&2; exit 1 ;;
+		-F|--field-separator) shift ;;   # 分隔符：本子集不导出多字段，忽略
+		-l) shift ;;                     # 结果数上限：忽略
+		-e) EXPRS+=("${2:?jsonfilter: -e 需要表达式}"); shift ;;
+		-h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) printf 'jsonfilter: 未知参数 %s\n' "$1" >&2; exit 2 ;;
+	esac
+	shift
+done
+
+if [ "${#EXPRS[@]}" -eq 0 ]; then
+	[ -n "$Q" ] || printf 'jsonfilter: 缺少 -e 表达式\n' >&2
+	exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+	[ -n "$Q" ] || printf 'jsonfilter: jq 不可用（openclash-rt 依赖 jq）\n' >&2
+	exit 1
+fi
+
+# JsonPath 表达式 → jq 表达式
+# 只做三件事：去 @ 根；.* → []?；其余原样（路径 .a.b.c 两者语法兼容）。
+# 注意 .* 要整体替换成 []?（. 与 * 一起），不能只替换 *：
+#   @.a.instances.*.running → .a.instances.[]?.running（错误，多了点）
+#   @.a.instances.*.running → .a.instances[]?.running （正确）
+# jq 的 .instances[] 是"遍历对象值/数组元素"，? 是容错（无匹配不报错）。
+translate() {
+	local e="$1"
+	e="${e#@}"                 # 去根 @
+	e="${e//\.\*/[]?}"         # .* → []? （一层通配，点与星一起替换）
+	printf '%s' "$e"
+}
+
+rc=0
+for e in "${EXPRS[@]}"; do
+	je="$(translate "$e")"
+	# jq 输入：-i 文件 或 stdin；-a 隐式数组模式对 jq 而言输入已是 JSON 流，
+	# 上游未用 -a，这里保留但简化为同等处理（jq 天然处理流式 JSON）。
+	# 关键：jq 对不存在的路径输出字面 "null"（非空），而 jsonfilter 输出空。
+	# 上游用 [ -z "$(jsonfilter ...)" ] 判断"取不到值"，若拿到 "null" 会误判
+	# 为"取到了"，继续用 "null" 当版本号。故必须把纯 null 行过滤成空。
+	# 用 jq 的 `// empty` 无法处理嵌套路径的 null，统一在输出层过滤更稳：
+	#   jq -r 输出的 "null" 只有两种情况——值是 null 或路径不存在，两者
+	#   jsonfilter 都返回空，故 `grep -vx null` 等价。
+	if ! jq -r "$je" ${INFILE:+"$INFILE"} 2>/dev/null | grep -vx 'null'; then
+		rc=1
+	fi
+done
+exit $rc

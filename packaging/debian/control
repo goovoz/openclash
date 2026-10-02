@@ -14,18 +14,21 @@ Depends: bash,
          ca-certificates,
          unzip,
          ruby,
+         jq,
          iproute2,
          procps,
          sysvinit-utils,
          cron,
          nftables,
          dnsmasq,
+         net-tools,
+         ipcalc,
+         bind9-dnsutils,
          lua5.1,
          libc6 (>= 2.31)
 Recommends: kmod,
             ipset,
             iputils-ping,
-            bind9-dnsutils,
             socat
 Suggests: docker.io
 Built-Using: OpenClash @UPSTREAM_VERSION@ (commit @UPSTREAM_COMMIT@)
