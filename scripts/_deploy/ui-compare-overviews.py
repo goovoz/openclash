@@ -6,18 +6,15 @@ openclash-rt · Deb 与 OpenWrt 两台机器的 Overviews 页面对照截图
 
 用法： python scripts/_deploy/ui-compare-overviews.py
 """
-import asyncio
+import asyncio, os, sys, os, sys
 from playwright.async_api import async_playwright
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from credentials import targets, SEL_DEBIAN, SEL_OPENWRT
 
 OUT = r"C:/Users/HHH/WorkBuddy/Worktrees/openclash 改造任意服务器端/main-a538dd5b/.ui-shots"
 
-TARGETS = [
-    # (标签, base, login_path, user, password)
-    ("debian", "http://172.20.0.101:9080",
-     "/cgi-bin/luci/", "root", "password"),
-    ("openwrt", "http://172.20.0.2",
-     "/cgi-bin/luci/", "root", "DAM%ms7f"),
-]
+TARGETS = targets(need_openwrt=True)
 
 async def shot(pg, tag, name, full=True):
     path = f"{OUT}/cmp_{tag}_{name}.png"

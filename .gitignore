@@ -23,3 +23,5 @@ Thumbs.db
 .idea/
 *.swp
 .ui-shots/
+__pycache__/
+*.pyc

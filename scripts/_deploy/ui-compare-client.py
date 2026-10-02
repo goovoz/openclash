@@ -10,16 +10,16 @@ openclash-rt · OpenClash 客户端页（Overviews）逐区块对照
 
 用法： python scripts/_deploy/ui-compare-client.py
 """
-import asyncio, json
+import asyncio, os, sys, os, sys, json
 from playwright.async_api import async_playwright
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from credentials import targets, SEL_DEBIAN, SEL_OPENWRT
 
 OUT = r"C:/Users/HHH/WorkBuddy/Worktrees/openclash 改造任意服务器端/main-a538dd5b/.ui-shots"
 CLIENT = "/cgi-bin/luci/admin/services/openclash/client"
 
-TARGETS = [
-    ("debian",  "http://172.20.0.101:9080", ("#luci_username", "#luci_password"), "root", "password"),
-    ("openwrt", "http://172.20.0.2",         ("#cbi-input-user", "#cbi-input-password"), "root", "DAM%ms7f"),
-]
+TARGETS = targets(need_openwrt=True)
 
 # client.lua 里定义的区块标题（上游 OpenClash 的Dashboard 分区）
 KNOWN_BLOCKS = [

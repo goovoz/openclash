@@ -15,7 +15,8 @@ openclash-rt · 10 个 502 端点的真机UI 点击验证
 import asyncio, sys, json
 from playwright.async_api import async_playwright
 
-BASE = "http://172.20.0.101:9080"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from credentials import DEBIAN_URL as BASE, DEBIAN_USER, DEBIAN_PWD, SEL_DEBIAN
 OUT = r"C:/Users/HHH/WorkBuddy/Worktrees/openclash 改造任意服务器端/main-a538dd5b/.ui-shots"
 
 # 502 端点 → 在 UI 上的语义说明（用于报告）
@@ -90,8 +91,8 @@ async def main():
         # 登录
         await pg.goto(f"{BASE}/cgi-bin/luci/", wait_until="networkidle", timeout=60000)
         if await pg.query_selector("#luci_username"):
-            await pg.fill("#luci_username", "root")
-            await pg.fill("#luci_password", "password")
+            await pg.fill(SEL_DEBIAN[0], DEBIAN_USER)
+            await pg.fill(SEL_DEBIAN[1], DEBIAN_PWD)
             await pg.press("#luci_password", "Enter")
             await pg.wait_for_load_state("networkidle", timeout=60000)
         print("登录后:", pg.url, "|", await pg.title())
