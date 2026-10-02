@@ -226,8 +226,12 @@ jobs:
           #     openclash-rt depends on dnsmasq; however: Package dnsmasq is not installed.
           # 所以构建期就装上，让 verify 的 dpkg -i 能干净落位。
           # （后面的 Install & end-to-end 步骤也会用到，这里一并装，省得重复。）
+          #
+          # P5 新增：jq（jsonfilter 垫片依赖）、net-tools（ifconfig/route）、
+          # ipcalc、bind9-dnsutils（dig/nslookup）。这些也已加进 Depends，
+          # 必须在此预装，否则 verify 的 dpkg -i 会报依赖不满足。
           sudo apt-get install -y --no-install-recommends \
-            dnsmasq nftables util-linux
+            dnsmasq nftables util-linux jq net-tools ipcalc bind9-dnsutils
       - name: Sync upstream
         run: bash scripts/sync-upstream.sh
       - name: Ensure LuCI vendor tree
