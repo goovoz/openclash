@@ -509,7 +509,15 @@ local function run_cgi(sock, req, path_info)
 	-- LUA_INIT=@file 让 CGI 子进程（lua5.1）在 require 任何模块前先执行
 	-- luci-session-bootstrap.lua，预注入 package.loaded["ubus"]，使上游
 	-- util.ubus("session", ...) 走本地实现（docs/06 §3.1）。
-	setenv("LUA_INIT", "@/usr/lib/openclash-rt/luci-session-bootstrap.lua")
+	-- 条件注入：bootstrap 文件由打包期落位到 /usr/lib/openclash-rt/；CI 的
+	-- test_luci_host 用 mock CGI（本身是 lua5.1 脚本）在 staging 目录跑，
+	-- 该文件不存在时若仍注入 LUA_INIT，lua5.1 子进程会因打不开 @file 而
+	-- 崩溃 → mock CGI 全部 502。故只在文件真实存在时才注入（真机 dpkg 后
+	-- 文件必然存在，登录鉴权照常生效；CI staging 则自然跳过）。
+	local bootstrap_lua = "/usr/lib/openclash-rt/luci-session-bootstrap.lua"
+	if nixio_fs.stat(bootstrap_lua, "type") == "regular" then
+		setenv("LUA_INIT", "@" .. bootstrap_lua)
+	end
 
 	-- REMOTE_ADDR: 用 nixio 的 getsockname/getpeername
 	local peer = sock:getpeername() or ""

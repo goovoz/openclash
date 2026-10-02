@@ -87,6 +87,31 @@ if ! command -v lua5.1 >/dev/null 2>&1; then
 fi
 
 # -----------------------------------------------------------------------------
+# 前置检查：完整运行时环境（P4 session/uci 的真实宿主产物）
+# -----------------------------------------------------------------------------
+# 本套件测的是「dpkg 安装后」的进程内认证链路，依赖真实运行时产物：
+#   A 组：/sbin/uci + /etc/config/rpcd + /etc/shadow
+#   G 组：/etc/config/luci + libuci 绑定（require "uci"）
+#   H 组：/usr/lib/openclash-rt/luci-session*.lua + vendor LuCI（luci.config）
+# CI 的纯单元 job（Run all unit suites）没有这些（它们由 build-deb 的
+# --deb e2e 在 dpkg -i 之后才带上系统），硬跑只会得到"缺环境"的假红。
+# 故这里探测：缺任一关键产物 → 整体 SKIP（与 e2e 的 HAS_UBUS/HAS_LUCI 同一套
+# "缺环境显式降级"纪律，绝不把信号淹没在环境缺失里）。真机（dpkg 后）全跑。
+_env_missing=""
+[ -x /sbin/uci ] || _env_missing="$_env_missing /sbin/uci"
+[ -f /etc/config/rpcd ] || _env_missing="$_env_missing /etc/config/rpcd"
+[ -f /etc/config/luci ] || _env_missing="$_env_missing /etc/config/luci"
+[ -d /usr/share/rpcd/acl.d ] || _env_missing="$_env_missing /usr/share/rpcd/acl.d"
+[ -f /usr/lib/openclash-rt/luci-session.lua ] || _env_missing="$_env_missing /usr/lib/openclash-rt/luci-session.lua"
+[ -f /usr/lib/openclash-rt/luci-session-bootstrap.lua ] || _env_missing="$_env_missing /usr/lib/openclash-rt/luci-session-bootstrap.lua"
+if [ -n "$_env_missing" ]; then
+	printf 'SKIP 缺少运行时产物（%s）—— 本套件需 dpkg 安装后的完整环境，--deb e2e 覆盖\n' "$_env_missing" >&2
+	SKIP=$((SKIP+1))
+	printf 'PASS %d FAIL %d SKIP %d\n' "$PASS" "$FAIL" "$SKIP"
+	exit 0
+fi
+
+# -----------------------------------------------------------------------------
 # A. session.login 口令校验
 # -----------------------------------------------------------------------------
 LUA_A=$(cat <<'LUAEOF'
