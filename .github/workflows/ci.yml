@@ -220,6 +220,14 @@ jobs:
             build-essential cmake pkg-config git \
             libjson-c-dev lua5.1 liblua5.1-0-dev \
             dpkg-dev fakeroot
+          # openclash-rt 的 Depends 里有 dnsmasq / nftables，而 Verify 步骤
+          # 要 `dpkg -i` 这个包。dpkg 不会自动装依赖，缺了会
+          #   dpkg: dependency problems prevent configuration of openclash-rt
+          #     openclash-rt depends on dnsmasq; however: Package dnsmasq is not installed.
+          # 所以构建期就装上，让 verify 的 dpkg -i 能干净落位。
+          # （后面的 Install & end-to-end 步骤也会用到，这里一并装，省得重复。）
+          sudo apt-get install -y --no-install-recommends \
+            dnsmasq nftables util-linux
       - name: Sync upstream
         run: bash scripts/sync-upstream.sh
       - name: Ensure LuCI vendor tree
@@ -464,8 +472,8 @@ jobs:
           echo "::notice::DISTRIB_ARCH=$A 是 OpenWrt 架构词汇 ✓"
       - name: Install & end-to-end (real .deb, real paths, real nftables)
         run: |
-          # 装上 e2e 会用到的可选依赖，让更多断言真正执行而不是 SKIP
-          sudo apt-get install -y --no-install-recommends nftables dnsmasq util-linux
+          # 依赖已在 Install build deps 步骤装好（dnsmasq / nftables / util-linux），
+          # 这里直接跑 e2e。
           sudo bash tests/e2e/linux/run-e2e.sh --deb "$(ls dist/openclash-rt_*.deb | head -1)"
       - name: Verify uninstall leaves DNS intact
         run: |
