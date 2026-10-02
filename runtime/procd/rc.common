@@ -33,6 +33,16 @@ if [ -z "${BASH_VERSION:-}" ] && [ -z "${_OC_RT_REEXEC:-}" ]; then
 	fi
 fi
 
+# 关闭 bash 的 brace expansion：上游 init 脚本里有大量 nft 命令用字面花括号
+# 如 `meta l4proto {tcp,udp}`。busybox ash（OpenWrt 的 /bin/sh）不做 brace
+# expansion，字面传给 nft 是对的；但 bash 会把 `{tcp,udp}` 展开成 `tcp udp`，
+# nft 直接语法错误（"unexpected th"）。set +B 让 bash 保持字面，与 ash 一致。
+# 这是「bash 重执行以兼容方言」的配套修正：既要 bash 的 ${var:0:-1} 方言，
+# 又不能要 bash 的 brace expansion 副作用。
+case "$-" in
+	*B*) set +B ;;
+esac
+
 . "$IPKG_INSTROOT/lib/functions.sh"
 . "$IPKG_INSTROOT/lib/functions/service.sh"
 

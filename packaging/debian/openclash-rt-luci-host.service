@@ -1,17 +1,18 @@
 [Unit]
 # openclash-rt 的 LuCI HTTP 宿主（P3 自研件）
 # -----------------------------------------------------------------------------
-# 这是 L2 兼容运行时的一部分，**不**依赖 uhttpd：监听 127.0.0.1:9080（默认），
-# 把请求作为 CGI 喂给 /www/cgi-bin/luci。上游入口代码零修改。
+# 这是 L2 兼容运行时的一部分，**不**依赖 uhttpd：监听 0.0.0.0:9080（默认，
+# 旁路由场景局域网设备访问），把请求作为 CGI 喂给 /www/cgi-bin/luci。
+# 上游入口代码零修改。
 # （9080 而非 9090：9090 留给 mihomo 内核 external-controller，底层不动。）
 # -----------------------------------------------------------------------------
 # 为什么 After=rpcd：上游 /www/cgi-bin/luci 入口 require "luci.dispatcher"，
 # dispatcher 又通过 luci.util.ubus("uci", ...) 走 rpcd。rpcd 没起来
 # 时打开 LuCI 会拿到 "Unable to establish ubus connection"。
 # -----------------------------------------------------------------------------
-# 为什么不让它监听公网：默认 127.0.0.1 是安全默认。开放到 0.0.0.0 必须显式
-# 改 /etc/config/openclash-rt 的 main.listen —— 这是设计选择（见
-# docs/02 §5.6 H10）。
+# 为什么默认监听 0.0.0.0：旁路由场景，局域网设备要访问 Web UI。安全由
+# nft 防火墙（OpenClash 的 openclash_wan_input chain 拒 WAN 侧）保证，
+# 而非 bind 回环。要回环可改 /etc/config/openclash-rt 的 main.listen。
 # -----------------------------------------------------------------------------
 Description=openclash-rt LuCI HTTP host (CGI-bridge)
 Documentation=https://github.com/vernesong/OpenClash

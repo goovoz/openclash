@@ -689,14 +689,16 @@ install -m 0755 "$ROOT/packaging/debian/etc-init.d-uhttpd" \
 # 7f) /etc/config/openclash-rt —— 宿主自己的 UCI 配置（P3）
 # ----------------------------------------------------------------------------
 # LuCI 宿主读这份 main 段（listen/port/script_timeout/max_connections）。
-# 不存在时宿主用 DEFAULTS（127.0.0.1:9080 / 3600 / 100）。
+# 不存在时宿主用 DEFAULTS（0.0.0.0:9080 / 3600 / 100）。
 # 提供这份 conffile 的目的是让用户能**不改 unit 文件**地调整宿主行为。
 # 端口用 9080：9090 留给 mihomo external-controller（上游默认 cn_port），
 # 底层保持上游一致、避免同步上游时冲突。
+# listen 用 0.0.0.0：旁路由场景，局域网设备要访问 Web UI；安全由 nft
+# 防火墙（OpenClash 会写 openclash_wan_input 拒 WAN 侧）保证，而非 bind 回环。
 if [ ! -f "$STAGE/etc/config/openclash-rt" ]; then
 	cat >"$STAGE/etc/config/openclash-rt" <<'EOF'
 config openclash_rt 'main'
-	option listen '127.0.0.1'
+	option listen '0.0.0.0'
 	option port '9080'
 	option script_timeout '3600'
 	option max_connections '100'
