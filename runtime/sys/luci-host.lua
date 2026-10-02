@@ -505,6 +505,12 @@ local function run_cgi(sock, req, path_info)
 	setenv("REDIRECT_STATUS",   "200")
 	setenv("HTTPS",             "off")
 
+	-- P4：注入进程内 ubus session 模块（替代外部 ubusd/rpcd）。
+	-- LUA_INIT=@file 让 CGI 子进程（lua5.1）在 require 任何模块前先执行
+	-- luci-session-bootstrap.lua，预注入 package.loaded["ubus"]，使上游
+	-- util.ubus("session", ...) 走本地实现（docs/06 §3.1）。
+	setenv("LUA_INIT", "@/usr/lib/openclash-rt/luci-session-bootstrap.lua")
+
 	-- REMOTE_ADDR: 用 nixio 的 getsockname/getpeername
 	local peer = sock:getpeername() or ""
 	setenv("REMOTE_ADDR",       peer)

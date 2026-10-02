@@ -154,6 +154,19 @@ cp -a "$UP/etc/uci-defaults/."         "$STAGE/usr/share/openclash/uci-defaults/
 #     require "luci.openclash" 全部 not found，8 个 #!/usr/bin/lua 脚本连依赖都加载不了。
 cp -a "$ROOT/upstream/luci-app-openclash/luasrc/." "$STAGE/usr/lib/lua/luci/"
 
+# 1a2) 上游 rpcd/acl.d → /usr/share/rpcd/acl.d/
+#     luci-app-openclash.json 授权 uci: ["openclash"] 的读写，是 dispatcher 判断
+#     能否访问 /admin/services/openclash/* 的 ACL 来源（access-group 里必须含
+#     "luci-app-openclash"）。P4 测绘（2026-10-02）发现真机 acl.d 缺这个 json，
+#     登录成功也会被拒在 openclash 页面门外 —— 与 vendor LuCI 的 acl.d 合并落位。
+#     注意：本段在 vendor LuCI 落位（§2）之前执行，此时 $STAGE/usr/share/rpcd/acl.d/
+#     目录尚未被 install-vendor-luci.sh 的 mkdir -p 创建，故必须先 mkdir -p，
+#     否则 cp -a 到不存在的目录会静默失败（被 2>/dev/null||true 吞掉）。
+if [ -d "$UP/usr/share/rpcd/acl.d" ]; then
+	mkdir -p "$STAGE/usr/share/rpcd/acl.d"
+	cp -a "$UP/usr/share/rpcd/acl.d/." "$STAGE/usr/share/rpcd/acl.d/"
+fi
+
 # 1z) CRLF 防线：上游树若在 Windows 上 checkout（core.autocrlf=true），
 #     所有文本文件会带 \r。MSYS→Linux 传输路径是否规范化取决于工具链，
 #     不能赌 —— 在 staging 上就地剥离所有会由 sh/bash 执行的文件：
@@ -311,6 +324,18 @@ install -m 0755 "$ROOT/runtime/net/dnsmasq-adapter.sh" "$STAGE/usr/lib/openclash
 # shebang 必须是 #!/usr/bin/lua5.1（与 cgi-bin/luci 同原则：依赖 Debian
 # 提供的 lua5.1 包，绕开 update-alternatives 路径以避免 5.3/5.4 抢占）。
 install -m 0755 "$ROOT/runtime/sys/luci-host.lua"      "$STAGE/usr/lib/openclash-rt/luci-host.lua"
+
+# 2d2) P4 进程内 ubus session 模块 + 引导（自研件）—— 替代外部 ubusd/rpcd 的 session 插件
+# ----------------------------------------------------------------------------
+# luci-session.lua 是进程内 session 实现（login/get/access/set/destroy），
+# 对齐 vendor/rpcd/session.c 语义（见 docs/06）。luci-session-bootstrap.lua
+# 通过 LUA_INIT=@file 在 CGI 子进程里预注入 package.loaded["ubus"]，让上游
+# util.ubus("session", ...) 走本地实现，不再依赖外部 ubusd/rpcd。
+# 两者必须与 luci-host.lua 同目录（/usr/lib/openclash-rt/），bootstrap 用绝对
+# 路径 dofile 加载 luci-session，不依赖 Lua 默认搜索路径。
+install -m 0644 "$ROOT/runtime/sys/luci-session.lua"            "$STAGE/usr/lib/openclash-rt/luci-session.lua"
+install -m 0644 "$ROOT/runtime/sys/luci-session-bootstrap.lua"  "$STAGE/usr/lib/openclash-rt/luci-session-bootstrap.lua"
+install -m 0644 "$ROOT/runtime/sys/luci-uci.lua"                "$STAGE/usr/lib/openclash-rt/luci-uci.lua"
 
 # 3) 兼容运行时 —— 保留一份可读副本，便于排障与升级对比
 cp "$ROOT/runtime/procd/rc.common"            "$STAGE/usr/lib/openclash-rt/procd/rc.common"
@@ -663,6 +688,27 @@ config openclash_rt 'main'
 	option port '9090'
 	option script_timeout '3600'
 	option max_connections '100'
+EOF
+fi
+
+# 7g) /etc/config/rpcd —— P4 进程内 session 的登录源（conffile）
+# ----------------------------------------------------------------------------
+# P4 的进程内 session 模块（runtime/sys/luci-session.lua）对齐 rpcd 的
+# rpc_login_test_login：读 /etc/config/rpcd 的 config login 段校验口令。
+# 这个文件**不是**给真 rpcd 用的（本包不依赖 rpcd），而是给进程内模块读的
+# 登录源。默认 login 段：
+#   username root + password $p$root → 用 Debian root 密码登录 LuCI
+#   （标准 LuCI 行为；$p$ 前缀 = 引用 /etc/shadow 的 root，见 docs/06 §1.3）
+#   list read '*' / write '*' → root 拥有全部 ACL group（OpenWrt 默认），
+#   对应 session.c 的 fnmatch(pattern, group) 通配匹配。
+# 用户可改这个文件自定义账号/口令（改后无需重启宿主，进程内模块每次读）。
+if [ ! -f "$STAGE/etc/config/rpcd" ]; then
+	cat >"$STAGE/etc/config/rpcd" <<'EOF'
+config login 'root'
+	option username 'root'
+	option password '$p$root'
+	list read '*'
+	list write '*'
 EOF
 fi
 

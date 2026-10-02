@@ -4,6 +4,7 @@
 /etc/config/firewall
 /etc/config/openclash-rt
 /etc/config/uhttpd
+/etc/config/rpcd
 /etc/rc.common
 /etc/init.d/uhttpd
 /etc/openwrt_release
