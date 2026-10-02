@@ -48,6 +48,7 @@ jobs:
             runtime/lib/build-common.sh \
             runtime/ubus/build-ubus.sh \
             runtime/upstream/pin-lua-interpreter.sh \
+            runtime/upstream/normalize-modes.sh \
             scripts/install-vendor-luci.sh \
             scripts/install-vendor-lmo.sh \
             tests/run-all.sh \
@@ -83,6 +84,7 @@ jobs:
             runtime/lib/build-common.sh \
             runtime/ubus/build-ubus.sh \
             runtime/upstream/pin-lua-interpreter.sh \
+            runtime/upstream/normalize-modes.sh \
             scripts/install-vendor-luci.sh \
             scripts/install-vendor-lmo.sh \
             tests/run-all.sh \
@@ -191,6 +193,18 @@ jobs:
         # 在 workflow 里补一行而变成"看着绿、其实没跑"。
         run: bash tests/run-all.sh --timeout 600
       - name: Linux end-to-end (real paths, real dash, real nftables in netns)
+        # 这一步跑的是 **staging 模式**（不装 .deb）：只装配兼容层那棵树，
+        # 因此它真正覆盖的是
+        #   L1 真 dash 下 rc.common 的 bash 重执行（MSYS 上永远测不到）
+        #   L2 上游硬编码绝对路径落位、L2b lua 钉定
+        #   L3 真实 nftables（unshare -n 隔离）
+        #   L4 procd → systemd 映射
+        #   L6 未修改的上游 init 脚本可被派发
+        #
+        # 而 ubus 底座（L2c）与 vendor LuCI（L2e）是 **.deb 才带得上系统的产物**，
+        # 这里没有，脚本会显式降级为 SKIP（与 L5 的 HAS_UCI 同一套纪律）——
+        # 它们的完整断言在 build-deb job 的 `--deb` 那一步执行。
+        # 不要为了"让它变绿"把这些改成硬断言：那会让信号淹没在环境缺失里。
         run: sudo bash tests/e2e/linux/run-e2e.sh
 
   build-deb:

@@ -123,11 +123,29 @@ UP="$ROOT/upstream/luci-app-openclash/root"
 # 真机验证（2026-10-01）确认装到 /usr/share/openclash/www 是错的——
 # 上游 postrm 也按 /www/luci-static/resources/openclash 清理。
 mkdir -p "$STAGE/www" "$STAGE/usr/lib/lua/luci"
-cp "$UP/etc/init.d/openclash"          "$STAGE/etc/init.d/openclash"
 cp -a "$UP/usr/share/openclash/."      "$STAGE/usr/share/openclash/"
 cp -a "$UP/www/."                      "$STAGE/www/" 2>/dev/null || true
 cp -a "$UP/etc/openclash/."            "$STAGE/usr/share/openclash/defaults/" 2>/dev/null || true
 cp -a "$UP/etc/uci-defaults/."         "$STAGE/usr/share/openclash/uci-defaults/" 2>/dev/null || true
+#    会把它们全压成 100644。实测未修之前打出的包里：
+#      /etc/init.d/openclash          -rw-r--r--   ← systemd 单元写的正是
+#                                                    ExecStart=/etc/init.d/openclash boot
+#      /usr/share/openclash/*.sh (25) -rw-r--r--
+#      /usr/share/openclash/*.lua (8) -rw-r--r--
+#
+#    /etc/init.d/openclash 缺位是**服务根本起不来**（journalctl 只留 203/EXEC）；
+#    而 /usr/share/openclash 下那 33 个更隐蔽 —— 上游是**直接执行**它们的：
+#      openclash_update.sh:91   /usr/share/openclash/openclash_core.sh "Meta" "$1" "$2" >/dev/null 2>&1
+#      yml_groups_set.sh:330    /usr/share/openclash/yml_proxys_set.sh "$CONFIG_FILE" >/dev/null 2>&1
+#      openclash_watchdog.sh:396   /usr/share/openclash/openclash_oix_checkin.lua >/dev/null 2>&1
+#      openclash.sh:37             $(/usr/share/openclash/openclash_urlencode.lua "$1")
+#    0644 下全部 Permission denied，而调用点几乎都带 `>/dev/null 2>&1` ——
+#    症状表现为「内核下载失败 / 订阅不更新 / 配置生成不出来」且**一条报错都没有**。
+#
+#    判据刻意用「文件自己有没有 shebang」而不是记一份清单：清单会漂，
+#    上游每次同步都可能增删脚本，漏一个就是一个静默故障。
+#    实现在 runtime/upstream/normalize-modes.sh（e2e 的 staging 模式共用同一份，
+#    避免两处判据漂移）。
 
 # 1a) 上游 luasrc -> /usr/lib/lua/luci/（与 vendor LuCI 同一落位契约）
 #     luasrc/ 是扁平树：openclash.lua -> luci/openclash.lua（module("luci.openclash")）、
@@ -149,6 +167,48 @@ find "$STAGE/etc/init.d" "$STAGE/usr/share/openclash/uci-defaults" \
      "$STAGE/usr/share/openclash" -type f \
      \( -name '*.sh' -o -path "$STAGE/etc/init.d/*" -o -path "$STAGE/usr/share/openclash/uci-defaults/*" \) \
      -exec sed -i 's/\r$//' {} +
+
+# 1y) 可执行位归一
+# ---------------------------------------------------------------------------
+# ⚠️ 这是实测出来的静默故障，不是洁癖。上游 ipkg 直接从 git 工作区 CP，
+#    可执行位由上游仓库的 100755 保证；而我们的链路
+#      sync-upstream.sh 稀疏检出 → 在 core.filemode=false 的主机上提交 → 检出
+#    会把它们全压成 100644。实测未修之前打出的包里：
+#      /etc/init.d/openclash          -rw-r--r--   ← systemd 单元写的正是
+#                                                    ExecStart=/etc/init.d/openclash boot
+#      /usr/share/openclash/*.sh (25) -rw-r--r--
+#      /usr/share/openclash/*.lua (8) -rw-r--r--
+#
+#    /etc/init.d/openclash 缺位是**服务根本起不来**（journalctl 只留 203/EXEC）；
+#    而 /usr/share/openclash 下那 33 个更隐蔽 —— 上游是**直接执行**它们的：
+#      openclash_update.sh:91      /usr/share/openclash/openclash_core.sh "Meta" "$1" "$2" >/dev/null 2>&1
+#      yml_groups_set.sh:330       /usr/share/openclash/yml_proxys_set.sh "$CONFIG_FILE" >/dev/null 2>&1
+#      openclash_watchdog.sh:396   /usr/share/openclash/openclash_oix_checkin.lua >/dev/null 2>&1
+#      openclash.sh:37             $(/usr/share/openclash/openclash_urlencode.lua "$1")
+#    0644 下全部 Permission denied，而调用点几乎都带 `>/dev/null 2>&1` ——
+#    症状表现为「内核下载失败 / 订阅不更新 / 配置生成不出来」且**一条报错都没有**。
+#
+#    判据刻意用「文件自己有没有 shebang」而不是记一份清单：清单会漂，
+#    上游每次同步都可能增删脚本，漏一个就是一个静默故障。
+#    实现在 runtime/upstream/normalize-modes.sh（e2e 的 staging 模式共用同一份，
+#    避免两处判据漂移）。
+#
+#    位置刻意排在 §1z（CRLF 剥离）**之后**：sed -i 会重建文件，虽然 GNU sed
+#    会保留原模式，但把归一放在所有"可能重建文件"的步骤之后，就不必依赖
+#    "某个工具恰好保留了 mode"这种不可控性质 —— 归一是最后一道，做完即定稿。
+install -m 0755 "$UP/etc/init.d/openclash" "$STAGE/etc/init.d/openclash"
+# usr/share/openclash（含 uci-defaults 子目录）与 etc/init.d 下都可能存在
+# 带 shebang 却缺可执行位的文件，两处都要归一。uci-defaults 是**安装时被
+# 逐个 exec** 的（不是 source），同样会踩 Permission denied。
+_norm_n="0"
+for _norm_dir in "$STAGE/usr/share/openclash" "$STAGE/etc/init.d"; do
+	_norm_cur="$(bash "$ROOT/runtime/upstream/normalize-modes.sh" \
+		--dir "$_norm_dir")" \
+		|| die "可执行位归一失败（目录 $_norm_dir，原因见上面的 norm-mode 输出）"
+	_norm_n=$((_norm_n + _norm_cur))
+done
+[ -n "$_norm_n" ] || die "normalize-modes.sh 未返回归一处数（stdout 被污染？）"
+log "可执行位归一：${_norm_n} 个带 shebang 的上游脚本 -> 0755（另含 /etc/init.d/openclash）"
 
 # 1b) 把上游对「系统 lua」的依赖钉死到 lua5.1（P1.5 的语义前提）
 # ---------------------------------------------------------------------------
@@ -215,6 +275,15 @@ cat >"$STAGE/usr/lib/openclash-rt/packaging-adaptations.txt" <<EOF
     契约：docs/03-路径契约.md §3.2（命名 <pkg>.<lang>.lmo）
     工具：scripts/install-vendor-lmo.sh
     附带清理：.po 源 / .y / .c / .h 不入 staging；po2lmo 二进制本身不入 deb
+[5] 可执行位归一（本次修正 ${_norm_n} 个 + /etc/init.d/openclash）
+    原因：sync-upstream 链路（稀疏检出 → 在 core.filemode=false 的主机上提交）
+          会把上游脚本压成 100644。而上游是**直接执行**这些文件的，例如
+            openclash_update.sh:91  /usr/share/openclash/openclash_core.sh "Meta" ... >/dev/null 2>&1
+            yml_groups_set.sh:330   /usr/share/openclash/yml_proxys_set.sh "\$CONFIG_FILE" >/dev/null 2>&1
+          0644 下全部 Permission denied，且因调用点带 >/dev/null 2>&1 而**零报错**；
+          /etc/init.d/openclash 缺位则让 systemd 单元 203/EXEC 直接起不来。
+    判据：文件头两字节 == "#!"（shebang 即"我是可执行入口"的自我声明，不会漏也不会误伤）
+    工具：runtime/upstream/normalize-modes.sh
 EOF
 chmod 0644 "$STAGE/usr/lib/openclash-rt/packaging-adaptations.txt"
 

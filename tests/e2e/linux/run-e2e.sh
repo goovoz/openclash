@@ -145,8 +145,19 @@ cp "$ROOT/runtime/shell/config/uci.sh"         "$SRC/lib/config/uci.sh"
 cp "$ROOT/runtime/net/fw4"                     "$SRC/usr/sbin/fw4"
 cp "$ROOT/runtime/net/prepare-tmp.sh"          "$SRC/usr/lib/openclash-rt/prepare-tmp.sh"
 cp "$ROOT/runtime/net/dnsmasq-adapter.sh"      "$SRC/usr/lib/openclash-rt/dnsmasq-adapter.sh"
-cp "$UP/etc/init.d/openclash"                  "$SRC/etc/init.d/openclash"
+# 与 scripts/build-deb.sh §1y 同源：可执行位归一（工具与判据共用同一份实现）。
+# 上游是**直接执行** /usr/share/openclash 下这些 .sh/.lua 的（不是 source），
+# 0644 会让调用 Permission denied，而调用点几乎都带 >/dev/null 2>&1 —— 零报错的
+# 静默故障。staging 模式若不做，L2 那组可执行位断言就只是在测"我们忘了归一"。
+install -m 0755 "$UP/etc/init.d/openclash"     "$SRC/etc/init.d/openclash"
 cp -a "$UP/usr/share/openclash/."              "$SRC/usr/share/openclash/"
+_norm_n="$(bash "$ROOT/runtime/upstream/normalize-modes.sh" \
+	--dir "$SRC/usr/share/openclash")" || _norm_n="-1"
+if [ "$_norm_n" != "-1" ]; then
+	ok "S1 可执行位归一（${_norm_n} 个 shebang 脚本 -> 0755，与 build-deb.sh §1y 同源）"
+else
+	no "S1 可执行位归一" "normalize-modes.sh 返回非零（详见它打在 stderr 上的报告）"
+fi
 
 # 真实 uci：优先取已构建产物，其次取 .deb 解包结果
 OPT="${OCRT_OPT:-$ROOT/packaging/build/opt/openclash-rt}"
@@ -206,6 +217,36 @@ EOF
 
 ok "上游已载入 $(ls "$SRC/usr/share/openclash" | wc -l) 个运行时文件"
 
+# 与 scripts/build-deb.sh §1b **同源**的动作：把上游 11 处裸 lua 钉到
+# /usr/bin/lua5.1。
+#
+# 为什么 staging 模式也必须做（不做会怎样，是实测出来的）：
+#   pin-lua 是**打包期**动作，而 L2b 那 4 条断言断言的是
+#   "装到系统上之后 /usr/share/openclash 的形态"。staging 模式装的正是这里
+#   组装的这棵树 —— 跳过 pin 就等于让那 4 条断言永远在测一个**我们从不交付的
+#   形态**，于是它们恒红，且红得毫无信息量（CI 的 test job 正是这个环境）。
+#   补上之后，L2b 在两种模式下都变成"真的在验钉定结果"。
+LUA_BIN=/usr/bin/lua5.1
+export LUA_BIN
+_pin_n="0"
+if _pin_n="$(bash "$ROOT/runtime/upstream/pin-lua-interpreter.sh" \
+	--dir "$SRC/usr/share/openclash")"; then
+	ok "S1 lua 解释器已钉到 $LUA_BIN（改写 ${_pin_n:-0} 处，与 build-deb.sh §1b 同源）"
+else
+	no "S1 lua 解释器钉到 $LUA_BIN" \
+		"pin-lua-interpreter.sh 返回非零（详见它打在 stderr 上的报告）"
+fi
+
+# 适配清单随兼容层一起发布（build-deb.sh §1c 的同名产物）。
+# L2b 最后一条断言会检查它落到了 /usr/lib/openclash-rt/ 下；staging 模式
+# 若不在这一步生成，那条断言同样会去测一个不存在的交付物。
+cat >"$SRC/usr/lib/openclash-rt/packaging-adaptations.txt" <<EOF
+# openclash-rt 打包期对上游文件做过的定点适配（e2e staging 模式生成）
+[1] lua 解释器钉定（本次改写 ${_pin_n:-0} 处）
+    工具：runtime/upstream/pin-lua-interpreter.sh
+    适用：usr/share/openclash/ 下全部 *.lua 与 *.sh
+EOF
+
 # -----------------------------------------------------------------------------
 # 2. 安装到真实路径
 # -----------------------------------------------------------------------------
@@ -247,6 +288,8 @@ else
 	_install_file "$SRC/usr/sbin/fw4"             /usr/sbin/fw4                 0755
 	_install_file "$SRC/usr/lib/openclash-rt/prepare-tmp.sh"     /usr/lib/openclash-rt/prepare-tmp.sh     0755
 	_install_file "$SRC/usr/lib/openclash-rt/dnsmasq-adapter.sh" /usr/lib/openclash-rt/dnsmasq-adapter.sh 0755
+	_install_file "$SRC/usr/lib/openclash-rt/packaging-adaptations.txt" \
+		/usr/lib/openclash-rt/packaging-adaptations.txt 0644
 	_install_tree "$SRC/usr/share/openclash"      /usr/share/openclash
 
 	if [ "$HAS_UCI" = "1" ]; then
@@ -330,6 +373,20 @@ done
 chk "/etc/rc.common 可执行" "$([ -x /etc/rc.common ] && echo y || echo n)" "y"
 chk "/etc/init.d/openclash 可执行" "$([ -x /etc/init.d/openclash ] && echo y || echo n)" "y"
 
+# 上游是**直接执行** /usr/share/openclash 下这些脚本的，不是 source：
+#   openclash_update.sh:91        /usr/share/openclash/openclash_core.sh "Meta" "$1" "$2" >/dev/null 2>&1
+#   yml_groups_set.sh:330         /usr/share/openclash/yml_proxys_set.sh "$CONFIG_FILE" >/dev/null 2>&1
+#   openclash_watchdog.sh:258     $(/usr/share/openclash/openclash_get_network.lua "wanip")
+#   openclash_watchdog.sh:401     && /usr/share/openclash/openclash.sh
+# 0644 下这些调用全部 Permission denied —— 而调用点几乎都带 `>/dev/null 2>&1`，
+# 于是症状是「内核下载失败 / 订阅不更新 / 配置生成不出来」且**一条报错都没有**。
+# 这类静默故障必须锁住：判据与修复工具同源（runtime/upstream/normalize-modes.sh，
+# 由 build-deb.sh §1y 与本脚本 S1 各调一次）。
+for f in openclash_core.sh openclash.sh yml_proxys_set.sh openclash_get_network.lua; do
+	chk "可执行 /usr/share/openclash/$f（上游直接执行，非 source）" \
+		"$([ -x "/usr/share/openclash/$f" ] && echo y || echo n)" "y"
+done
+
 # 上游 init.d 前 12 行 source 的 5 个库必须真实存在
 for f in openclash_ps.sh ruby.sh log.sh uci.sh openclash_curl.sh; do
 	if [ -f "/usr/share/openclash/$f" ]; then ok "上游依赖库 $f"; else no "上游依赖库 $f"; fi
@@ -390,6 +447,22 @@ fi
 # -----------------------------------------------------------------------------
 it "L2c ubus 底座：产物、cpath 命中、ldconfig 登记、require 实测"
 
+# ⚠️ 环境判据（与 L5 的 HAS_UCI 同一套纪律）：
+#   ubus 底座是**构建产物**（runtime/ubus/build-ubus.sh 产出，由 .deb 带到系统），
+#   staging 模式的 e2e 只装配"兼容层"那棵树，**不会**去编 ubus。此时这一节的
+#   6 条断言必然全红，而红的原因是"没装 ubus"而不是"装错了"—— 那不是缺陷，
+#   让它们红只会淹没真正的缺陷信号（CI 的 test job 正是这种环境）。
+#   于是这里显式降级为 SKIP；完整形态由 build-deb job 的 `--deb <包>` 那一步覆盖。
+HAS_UBUS=0
+if [ -x /usr/sbin/ubusd ] && [ -x /usr/bin/ubus ] && [ -f /usr/lib/lua/5.1/ubus.so ]; then
+	HAS_UBUS=1
+fi
+
+if [ "$HAS_UBUS" != 1 ]; then
+	skip "L2c ubus 底座" \
+		"本机未安装 ubus 底座（缺 ubusd / ubus / /usr/lib/lua/5.1/ubus.so）；完整断言请用 run-e2e.sh --deb <包> 跑"
+else
+
 for x in /usr/sbin/ubusd /usr/sbin/rpcd /usr/bin/ubus; do
 	chk "可执行 $x" "$([ -x "$x" ] && echo y || echo n)" "y"
 done
@@ -424,6 +497,8 @@ if command -v lua5.1 >/dev/null 2>&1; then
 else
 	skip "Lua C 模块 require 实测" "未安装 lua5.1"
 fi
+
+fi  # end of: HAS_UBUS = 1 才验 ubus 底座
 
 # -----------------------------------------------------------------------------
 # L2d —— /sbin/uci 的落位与"禁止自指链接"
@@ -461,6 +536,18 @@ fi
 # L2e —— vendor LuCI 布局（P2-A；docs/03 §3.1 表的安装后核验）
 # -----------------------------------------------------------------------------
 it "L2e vendor LuCI 布局（库/静态资源/入口/ACL 四类）"
+
+# 环境判据（同 L2c / L5 的纪律）：vendor LuCI 是**安装产物**
+# （scripts/install-vendor-luci.sh 产出，由 .deb 带到系统）。staging 模式不会
+# 去装它，此时 /usr/lib/lua/luci/dispatcher.lua 等一整组路径必然不存在 ——
+# 那是"没装"而不是"装错"。显式降级为 SKIP，完整形态交给 `--deb` 那一步。
+HAS_LUCI=0
+[ -f /usr/lib/lua/luci/dispatcher.lua ] && HAS_LUCI=1
+
+if [ "$HAS_LUCI" != 1 ]; then
+	skip "L2e vendor LuCI 布局" \
+		"本机未安装 vendor LuCI（缺 /usr/lib/lua/luci/dispatcher.lua）；完整断言请用 run-e2e.sh --deb <包> 跑"
+else
 
 for f in \
 	/usr/lib/lua/luci/dispatcher.lua \
@@ -507,7 +594,17 @@ _ns2="$(grep -m1 -oE 'module[[:space:]]*\(?[[:space:]]*"[^"]+"' /usr/lib/lua/luc
 chk "L2e util 的 module 名" "$_ns2" "luci.util"
 
 # 纯 Lua 模块加载实测（不依赖 C 模块的几个：luci.config 只读 /etc/config/luci）
-if command -v lua5.1 >/dev/null 2>&1; then
+#
+# ⚠️ 它其实**并不**纯 Lua：luci.config 会 require luci.util，而
+#    vendor/luci/luci-lib-base/luasrc/util.lua:15 是**无条件的顶层**
+#      local _ubus = require "ubus"
+#    所以 ubus.so 不在默认 cpath 上时，这条会以 `module 'ubus' not found` 失败
+#    —— 报的是 luci.config 加载不了，真凶却是 ubus 底座没装。因此它必须再叠一层
+#    HAS_UBUS 判据，否则会变成一条"看起来在验 LuCI，实际在验 ubus"的误导性断言。
+if [ "$HAS_UBUS" != 1 ]; then
+	skip "L2e require 'luci.config'" \
+		"luci.util 顶层 require 'ubus'，ubus.so 未装；先满足 L2c 的环境条件再验"
+elif command -v lua5.1 >/dev/null 2>&1; then
 	if env -u LUA_PATH -u LUA_CPATH lua5.1 -e 'require("luci.config")' >/dev/null 2>&1; then
 		ok "L2e require 'luci.config'（默认搜索路径，纯 Lua 模块）"
 	else
@@ -515,6 +612,8 @@ if command -v lua5.1 >/dev/null 2>&1; then
 			"$(env -u LUA_PATH -u LUA_CPATH lua5.1 -e 'require("luci.config")' 2>&1 | head -1)"
 	fi
 fi
+
+fi  # end of: HAS_LUCI = 1 才验 vendor LuCI 布局
 
 # -----------------------------------------------------------------------------
 # 4. L1 —— dash → bash 重执行（本项目最脆弱的一环）

@@ -293,8 +293,13 @@ chk "I 默认 LUA_BIN 是 /usr/bin/lua5.1" \
 #    要断言的是**调用那一行**本身。
 chk "I build-deb.sh 有调用它的命令行" \
 	"$(grep -cE '^_lua_rewritten="\$\(bash .*pin-lua-interpreter\.sh' "$BUILD_DEB" || true)" "1"
-chk "I 调用点在 staging 的 usr/share/openclash 上" \
-	"$(grep -cE '^\s*--dir "\$STAGE/usr/share/openclash"\)"' "$BUILD_DEB" || true)" "1"
+# ⚠️ 必须锚定「pin-lua 调用后面的那个 --dir」，不能只数 `--dir "$STAGE/usr/share/openclash"`：
+#   build-deb.sh 里现在有**两个**指向同一 staging 目录的 --dir —— 一个是
+#   normalize-modes.sh 的（§1y），一个是 pin-lua 的（§1b）。泛匹配会数成 2。
+#   用 `-A1` 取 pin-lua 调用行的下一行再判 --dir，语义才是"pin-lua 钉的是 staging 树"。
+_pin_dir="$(grep -A1 '^_lua_rewritten="\$(bash .*pin-lua-interpreter\.sh' "$BUILD_DEB" \
+	| grep -cE '^[[:space:]]*--dir "\$STAGE/usr/share/openclash"\)"' || true)"
+chk "I 调用点在 staging 的 usr/share/openclash 上" "$_pin_dir" "1"
 _hits="$(grep -c '工具：runtime/upstream/pin-lua-interpreter.sh' "$BUILD_DEB" || true)"
 chk "I 适配清单里记录了工具路径（供上游同步比对，至少 1 处）" \
 	"$([ "$_hits" -ge 1 ] && echo yes || echo no)" "yes"
