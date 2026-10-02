@@ -919,6 +919,86 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# 9. mihomo 内核冒烟测试（下载 + -t 校验 + 启动 + 监听，P5 核心链路）
+# -----------------------------------------------------------------------------
+# P5 打通的核心链路（内核下载→配置→启动→透明代理）此前只在真机手动验证，CI 无
+# 覆盖。这里补一个**稳健的内核冒烟测试**：验证内核二进制能下载、能 -t 校验一份
+# 最小配置、能启动并监听端口。不验证真实翻墙（CI 无机场节点）。
+#
+# 为什么下载失败要 SKIP 而非 FAIL：内核从 raw.githubusercontent.com 下载 ~12.5MB，
+# 真机实测大文件会截断（需断点续传）；CI runner 到 GitHub 的网络也应视为不稳定，
+# 下载失败属环境限制而非兼容层缺陷（与 L2c/L5 的 HAS_UBUS/HAS_UCI 同一套纪律）。
+it "L7  mihomo 内核冒烟（下载 + -t 校验 + 启动 + 监听）"
+
+CORE="/etc/openclash/core/clash_meta"
+CORE_ARCH="${OCRT_CORE_ARCH:-linux-amd64-v3}"
+CORE_URL="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-${CORE_ARCH}.tar.gz"
+CORE_SIZE="${OCRT_CORE_SIZE:-13170872}"   # 已知完整大小（am64-v3 内核）
+
+# 尝试下载内核（断点续传，最多 20 次）
+if [ ! -x "$CORE" ]; then
+	mkdir -p /etc/openclash/core
+	TMPCORE=$(mktemp)
+	_down_ok=0
+	for _i in $(seq 1 20); do
+		curl -s -m 20 -C - -o "$TMPCORE" "$CORE_URL" 2>/dev/null
+		_sz=$(stat -c %s "$TMPCORE" 2>/dev/null || echo 0)
+		if [ "$_sz" -ge "$CORE_SIZE" ]; then _down_ok=1; break; fi
+	done
+	if [ "$_down_ok" = "1" ]; then
+		tar -xzf "$TMPCORE" -C /tmp/ 2>/dev/null
+		mv /tmp/clash "$CORE" 2>/dev/null
+		chmod 0755 "$CORE"
+		rm -f "$TMPCORE"
+	fi
+fi
+
+if [ ! -x "$CORE" ]; then
+	skip "内核下载 + 落位" "无法从 GitHub 下载内核（CI 网络限制）；内核启动断言跳过"
+else
+	ok "内核下载 + 落位（$CORE）"
+
+	# -t 校验一份最小 DIRECT 配置
+	MINCFG=$(mktemp)
+	cat > "$MINCFG" <<'EOF'
+mixed-port: 7893
+allow-lan: true
+mode: rule
+log-level: info
+proxies:
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,DIRECT
+EOF
+	if "$CORE" -t -f "$MINCFG" -d /etc/openclash >/dev/null 2>&1; then
+		ok "内核 -t 校验最小配置"
+	else
+		no "内核 -t 校验最小配置" "$("$CORE" -t -f "$MINCFG" -d /etc/openclash 2>&1 | head -3 | tr '\n' '|')"
+	fi
+
+	# 启动 + 监听验证（后台启动，验证 7893 监听后停止）
+	"$CORE" -f "$MINCFG" -d /etc/openclash >/tmp/ocrt-core-smoke.log 2>&1 &
+	CORE_PID=$!
+	_listen=0
+	for _i in $(seq 1 20); do
+		if ss -tnlp 2>/dev/null | grep -q ':7893 '; then _listen=1; break; fi
+		sleep 0.5
+	done
+	if [ "$_listen" = "1" ]; then
+		ok "内核启动并监听 mixed-port 7893"
+	else
+		no "内核启动并监听 7893" "$(tail -3 /tmp/ocrt-core-smoke.log 2>/dev/null | tr '\n' '|')"
+	fi
+	kill "$CORE_PID" 2>/dev/null
+	wait "$CORE_PID" 2>/dev/null
+	rm -f "$MINCFG"
+fi
+
+# -----------------------------------------------------------------------------
 # 汇总
 # -----------------------------------------------------------------------------
 printf '\n\033[1m════════════════════════════════════════\033[0m\n'
