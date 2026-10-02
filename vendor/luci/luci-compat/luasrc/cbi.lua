@@ -482,18 +482,47 @@ end
 
 -- [openclash-rt 适配] 渲染 Map 下各 section 的 tab
 -- 供 view/cbi/map.htm 调用（21.02 的 map.htm 没有这段，是新版才有的）。
--- 逐 tab 包一层 .cbi-tabcontainer，配合 cbi.js 的 tab 切换。
+--
+-- ⚠️ 三个坑（2026-10-02 真机实测逐个踩过）：
+--
+-- 1) **不能**在这里再逐 tab 循环。tabcontainer.htm 自己就
+--    `for _, tab in ipairs(self.tab_names)` 循环渲染全部 tab
+--    （该模板第 1 行）。外面套一层 → N×N 重复。
+--
+-- 2) 传给模板的 `self` 必须是**section**（有 tab_names/tabs 的那个），
+--    不是 Map。传 Map 会静默渲染 0 个容器（Map 没有 tab_names）。
+--
+-- 3) **不能**用 `luci.template.render("cbi/tabcontainer", ...)` ——
+--    它在 21.02 里会把内容**累积**到全局输出缓冲，多次调用产生
+--    重复内容（实测 15 个 tab 的标题被输出约 30 遍，5MB 里大半是重复）。
+--    改为**直接内联渲染**：自己拼 tab 容器 div + 调section:render_tab()。
+--    这与 tabcontainer.htm 的逻辑等价，但不经过嵌套模板。
 function Map.render_tabcontainer(self, prefix)
+	local written = false
 	for _, section in ipairs(self.children) do
 		if section and section.has_tabs and section:has_tabs() then
 			for _, tab in ipairs(section.tab_names or {}) do
-				local data = section.tabs and section.tabs[tab]
-				local tabid  = string.format("%s%s", prefix or "m",
-					section.section or section.sectiontype or "")
-				luci.template.render("cbi/tabcontainer", {
-					self = section, tab = tab, data = data or {},
-					section = tabid, scope = self,
-				})
+				local data = (section.tabs or {})[tab] or {}
+				local css = "cbi-tabcontainer"
+				if not written then
+					-- 只有第一个 tab 带 cbi-tabcontainer 的主class，
+					-- 与新版 LuCI 行为一致：tab 切换脚本按容器定位
+					css = "cbi-tabcontainer cbi-tabcontainer-first"
+					written = true
+				end
+				luci.write(string.format(
+					'<div class="%s" id="container.%s.%s.%s" data-tab="%s" data-tab-title="%s" data-tab-active="%s">',
+					css, tostring(self.config), tostring(prefix or "m"),
+					tostring(tab), tostring(tab),
+					luci.util.pcdata(tostring(data.title or tab)),
+					tostring(tab == (section.selected_tab or section.tab_names[1]))
+				))
+				if data.description and #data.description > 0 then
+					luci.write('<div class="cbi-tab-descr">'
+						.. luci.util.pcdata(tostring(data.description)) .. '</div>')
+				end
+				section:render_tab(tab, prefix or "m")
+				luci.write('</div>')
 			end
 		end
 	end
