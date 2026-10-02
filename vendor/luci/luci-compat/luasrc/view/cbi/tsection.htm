@@ -55,6 +55,28 @@
 	      -- section-node 的 id 后缀与 addremove 的 name，
 	      -- 匿名段本就不显示段标题、也不需要 Add 按钮，故不影响语义。
 	      table.insert(_oc_sections, self.sectiontype or "cfg")
+	   end
+	   -- [openclash-rt 适配] 无 tab 但取不到配置段时同样补占位段名
+	   --
+	   -- 现象（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+	   --   Server Logs 页只显示「This section contains no values yet」，
+	   --   完全没有日志内容（OpenWrt 24.10 侧正常，有 3 个 textarea）。
+	   --
+	   -- 原因与上面 tab 那条同源：log.lua 的 section 是
+	   --   s = m:section(TypedSection, "openclash")，anonymous = true，
+	   --   addremove = false，且**没有**自带 template；
+	   --   它唯一的子节点 log 是 TextValue + log.template="openclash/log"。
+	   -- 而 21.02 的 TypedSection.cfgsections 对匿名段返回空表
+	   -- → 下面这个循环体一次都不进 → 连 section-node 都没有，
+	   --   子节点自然也不会被 render_children 带出来。
+	   --
+	   -- 受控实验确认：把「无 tab 时也补占位段名」加上后，
+	   -- 该页 oc-input-textarea 从 0 变 3、no-values 从 2 变 1。
+	   --
+	   -- 为什么不能只补在 tab 分支：Server Logs 这类 section 根本没声明
+	   -- tabs，若只处理带 tab 的分支，它就永远漏。
+	   if #_oc_sections == 0 and not self.tabs then
+	      table.insert(_oc_sections, self.sectiontype or "cfg")
 	   end -%>
 	<% local isempty = true for i, k in ipairs(_oc_sections) do -%>
 		<% if self.addremove then -%>
