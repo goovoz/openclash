@@ -740,6 +740,49 @@ config login 'root'
 EOF
 fi
 
+# 7h) /etc/config/system —— 上游 openclash.lua 的 device_name 来源
+# ----------------------------------------------------------------------------
+# 这是 2026-10-02 真机登录实测追出的缺陷（6 个备份/内核端点全 500）。
+#
+# 上游 luasrc/controller/openclash.lua:128 有一行**模块级**赋值：
+#     local device_name = uci:get("system", "@system[0]", "hostname")
+# 它在文件加载时就执行，device_name 随后被 7 个备份端点拼进
+# Content-Disposition 的文件名模板（:2094/2109/2123/2136/2149/2162 等）：
+#     'attachment; filename="Backup-OpenClash-%s-%s-%s.tar.gz"'
+#              %{ device_name, device_arh, os.date(...) }
+#
+# /etc/config/system 不存在 → uci:get 返回 nil → string.format 抛
+#   bad argument #2 to '?' (string expected, got nil)
+# → 整个 action_backup 系列 500。
+#
+# 为什么 build-deb 不能"顺手带一个"而要显式声明：
+#   7b/7c 已经为 firewall / network 做了同样的事（各有独立注释说明是哪个
+#   上游消费方需要它），system 是**同一类缺口**。只补 network 不补 system
+#   会让这个bug 在打包链路上再次静默复发。
+#
+# 字段取舍：
+#   hostname  —— 必填，否则 device_name=nil 直接 500（这是唯一必需项）
+#   timezone  —— 上游日志/订阅时间戳会读system.timezone，缺失时退化为 nil
+#               不崩但时间戳不可读，故给一个明确的默认值
+#   其余字段（zonename/log_size）上游不消费，不写，保持文件最小化
+#
+# 段名用**匿名**（section type 为 system、无 name）以精确匹配上游的
+# `@system[0]` 索引式查询——写成 config system 'main' 会让
+# uci:get("system","@system[0]",...) 取不到。
+#
+# 真机验证（2026-08-02，Debian 12 @ 172.20.0.101）：
+#   缺失时：backup / backup_ex_core / backup_only_config /
+#           backup_only_core / backup_only_proxy / backup_only_rule
+#           → 全部 HTTP 500
+#   补齐后：6 个端点全部 HTTP 200
+if [ ! -f "$STAGE/etc/config/system" ]; then
+	cat >"$STAGE/etc/config/system" <<'EOF'
+config system
+	option hostname 'openclash-rt'
+	option timezone 'UTC'
+EOF
+fi
+
 # 8) 版本标识（postinst / 排障用）
 cat >"$STAGE/usr/lib/openclash-rt/upstream-version" <<EOF
 PKG_VERSION=${UPSTREAM_PKG_VER}

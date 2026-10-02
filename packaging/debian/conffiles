@@ -5,6 +5,7 @@
 /etc/config/openclash-rt
 /etc/config/uhttpd
 /etc/config/rpcd
+/etc/config/system
 /etc/rc.common
 /etc/init.d/uhttpd
 /etc/openwrt_release
