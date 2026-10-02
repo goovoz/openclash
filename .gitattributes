@@ -1,8 +1,14 @@
-# Force LF on checkout.  eol=lf is the strongest form and overrides any
-# inherited `text=auto` from the `*` rule.
-* eol=lf
+# Force LF on checkout for text files, but let git auto-detect binaries.
+# text=auto 让 git 按内容启发式判断二进制（如 .tar.gz / 二进制 .txt），
+# 避免 `* eol=lf` 那种"全当文本强转 LF"把二进制文件 CRLF 污染的坑
+#（2026-10-02 真机发现 vendor 下两个 .tar.gz/.txt 被污染）。
+* text=auto eol=lf
 
 # Always-binary regardless of heuristics
+*.gz    binary
+*.tar   binary
+*.tgz   binary
+*.zip   binary
 *.jpg   binary
 *.jpeg  binary
 *.png   binary
@@ -29,3 +35,9 @@
 # Make sh/lua explicit for reviewers; same effect as * eol=lf but readable
 *.sh  eol=lf
 *.lua eol=lf
+
+# 字节级保真的测试夹具与二进制（不得做任何 CRLF/LF 转换）
+# 2026-10-02：这两个文件在 Debian 真机 checkout 时被 `* eol=lf` 误转，
+# 字节数变了（tar.gz 768249→768233，binary-data.txt 1162→1147）。
+vendor/luci/luci-lib-nixio/axTLS/httpd/kepler-1.1-snapshot-20070521-1825.tar.gz binary
+vendor/lucihttp/testcases/multipart/binary-data.txt binary
