@@ -203,3 +203,73 @@ Add 表单就 `create(nil, origin)`，不要求 name。
 
 > 教训（同 tab 渲染那次）：真机反复试改 + 多轮探针效率极低。应先
 > 完整读完 `view/openclash/tblsection.htm`（约 450 行）再建假设。
+
+---
+
+## 10. Add 按钮失效 —— 诊断结论（2026-10-02 20:00-20:50）
+
+### 实测结果：4 个 Add 里2 个好、2 个失效
+
+| 页面 / 区块 | section | 模板 | 自带 create | 结果 |
+|---|---|---|---|---|
+| Overwrite / Add Custom DNS Servers | `dns_servers` | `openclash/tblsection` | ✅ | **302 跳转，正常** |
+| Config Subscribe / Edit | `config_subscribe` | `cbi/tblsection` | ✅ | **302 跳转，正常** |
+| Plugin Settings / Lan Traffic Access List | `lan_ac_traffic` | `cbi/tblsection` | ❌ | 200 无反应 |
+| Overwrite / Set Authentication | `authentication` | `cbi/tblsection` | ❌ | 200 无反应 |
+
+### 已排除的原因
+
+- **两侧 DOM 完全一致**（按钮 `disabled=False`、`name` 相同，OpenWrt侧同样无段名输入框）
+- **点击确实 POST 了**（每次点击 2 个请求）
+- **CSRF token 正常**（带正确 token → 200；不带 → 403 "Form token mismatch"）
+- **`cbi.cts.tagname.*`前缀污染**：21.02 的 `formvaluetable` 是前缀匹配，
+  会把 tagname 那个空串收进Create 分支的 `name` —— 这是真问题，
+  但**不是本次失效的主因**（修掉它两个失效项仍 200）
+- **补 `create` 到 vendor 层**：`Map.prepare` 里给
+  「addremove + anonymous + create 仍是继承来的」装默认 create，
+  实测**仍未生效**（见下方踩坑）
+
+### 关键对照实验（证明了根因）
+
+手工给 `authentication`（**改上游 model 文件**）补：
+
+```lua
+s.create = function(self, section)
+    local sid = TypedSection.create(self, section)
+    if sid then HTTP.redirect(... sid) end
+    return sid
+end
+```
+
+→ 立刻 **302 成功**，新段 `cfg28b425` 出现。
+
+所以根因确定：**这两个 section 缺 create 覆盖，段建出来后没人 redirect /
+重新渲染，用户看不到 → 表现为「点了没反应」。**
+
+### 未完成的修复（已回滚，不留未验证代码）
+
+尝试在 vendor 兼容层补默认 create，**两次都失败**：
+
+1. 放在 `cbi.load` 的 `map:prepare()` 调用点 → 那里section 属性尚未
+   全部赋值，条件判断漏。
+2. 改到 `Map.prepare` → **但定义在第 266 行，而 `Map = class(Node)`
+   在第 320 行**。LuCI 的 `class()` 实现是把父类方法拷进子类表，
+   所以我的 `Map.prepare` 在 class() 执行**之前**就被 `Node.prepare`
+   覆盖了 → `Map.prepare` 从未被调用（探针 0输出证实）。
+   移到第 497 行（class 之后）后实测**仍是 200 无反应**。
+
+第二次失败的原因尚未查清（探针显示 `Map.prepare` 这次被调用了，
+但两个失效 section 仍没走 create 分支）。**已 `git checkout` 回滚
+`cbi.lua` 到 HEAD，真机同步回滚并md5 校验通过，不留未验证代码。**
+
+### 下一步建议
+
+1. 先在真机上用最简实验确认「`Map.prepare` 被调用时，
+   `sec.create == AbstractSection.create` 这个判据是否成立」
+   （可能是 class() 拷贝时把 create 也拷成了别的形态）；
+2. 或走另一条更直接的路：让 `tblsection.htm` 在渲染 Add 区块时，
+   无论有没有 create 覆盖都输出一个指向自身的 hidden 字段，
+   由兼容层的 parse 逻辑识别并 redirect。
+
+> 教训（第二次犯）：真机反复试改 + 多轮探针效率极低。应在动手前
+> 先用「一次只改一个变量」的受控实验定位，且每轮都保留可回滚的基线。
