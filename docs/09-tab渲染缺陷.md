@@ -128,3 +128,78 @@ section 列表并 include `tabcontainer`。改 1 个模板，但语义上与上�
 | 控件非空 | settings 控件数 > 200（OpenWrt 侧 279） |
 | 无 500 | 响应无 `500 Internal Server Error`，无 `Failed to execute template` |
 | 其余页不回归 | config-subscribe / config / log 的体积与基线相差 < 20% |
+
+---
+
+## 9. 追加：Add 按钮失效（同源缺陷，2026-10-02 20:00-20:30）
+
+用户反馈：多个页面的 Add 按钮点了没反应。
+
+| 页面 | 区块 |
+|---|---|
+| Plugin Settings | Lan Traffic Access List |
+| Overwrite Settings | Add Custom DNS Servers / Set Authentication of SOCKS5/HTTP(S) |
+| Config Subscribe | Config Subscribe Edit |
+
+### 已确认的事实（浏览器双机对照实测）
+
+1. **两侧 DOM 完全一致** —— 按钮都是 `disabled=False`、`visible=True`，
+   `name` 也相同（如 `cbi.cts.openclash.lan_ac_traffic.`）。OpenWrt 侧同样
+   没有段名输入框。
+2. **点击确实发出了 POST** —— 实测每次点击产生 2 个请求
+   （页面 POST + `admin/ubus`）。
+3. **提交后段数不变** —— 服务端 `uci show openclash | grep -c '=lan_ac_traffic$'`
+   前后都是 0。
+4. **带上 CSRF token 后服务端返回 302**（LuCI 提交后的正常重定向），
+   说明 CBI 提交链路本身是通的 —— 但仍未创建段。
+
+### 关键线索：上游自带的 tblsection 覆盖模板
+
+`grep -rl tagname /usr/share/lua/5.1/luci/` 命中三处，其中
+**`view/openclash/tblsection.htm`**（被 `config-overwrite.lua:525`
+`ds.template = "openclash/tblsection"` 引用）第 445 行有：
+
+```html
+<input type="hidden" name="cbi.cts.tagname.<config>.<sectiontype>" value="" />
+```
+
+并由页内 JS 把当前 tab 名写进去（供「按 tab 分组新增」用）。于是提交时表单
+里同时有两个字段：
+
+```
+cbi.cts.openclash.dns_servers.        = "Add"   ← 真正的按钮
+cbi.cts.tagname.openclash.dns_servers  = ""      ← 隐藏占位
+```
+
+而 **21.02 的 `luci.http.formvaluetable(prefix)` 是前缀匹配**
+（`http.lua:62`：`if k:find(prefix, 1, true) == 1`），传
+`crval = "cbi.cts.openclash.dns_servers"` 会把 `cbi.cts.tagname.*` 也收进来。
+`pairs` 遍历顺序不确定，`next()` 可能先取到 tagname 那个**空串** →
+`name=""` → 匿名段 `create(nil, "")` / 具名段 `checkscope("")` 判空 → 失败。
+
+**上游 OpenWrt 24.10 的 cbi.lua 认识 tagname**（会优先取它并按 tab 分组），
+所以那边正常。我们 vendor 的 21.02 没有这段逻辑。
+
+### 已实施的修复（cbi.lua 的 TypedSection.parse Create分支）
+
+不取 `next(formvaluetable(crval))`，改为**只认精确等于 `crval .. "."` 的键**
+（就是 Add 按钮本身），忽略 tagname 这类同前缀辅助字段；匿名段只要收到
+Add 表单就 `create(nil, origin)`，不要求 name。
+
+### 未解决 / 待续
+
+修复装上后，浏览器真实点击**仍未生效**（0/4 生效），探针显示
+`AbstractSection.create` 未被调用，且 `Map.parse` / `_cbi` 层的探针也未命中
+—— 即 CBI 提交链路在某个更早的环节就没走到 `TypedSection.parse`。
+
+**已排除**：CSRF token（带 token 后返回 302 而非 403）、token 前缀污染
+（已改为精确匹配）、`Map.parse` 早退分支。
+
+**下一步怀疑点**：`config-overwrite.lua:525` 把 `ds.template` 改成了
+`openclash/tblsection`，这可能让 `ds` 走了与 `TypedSection.parse` 不同的
+代码路径（上游模板可能自带 form 提交逻辑而不依赖 cbi.lua 的 create）。
+需要读 `view/openclash/tblsection.htm` 全文确认它的 Add 是走
+`cbi.cts.*` 表单还是自定义 JS。
+
+> 教训（同 tab 渲染那次）：真机反复试改 + 多轮探针效率极低。应先
+> 完整读完 `view/openclash/tblsection.htm`（约 450 行）再建假设。
