@@ -586,33 +586,55 @@ local function run_cgi(sock, req, path_info)
 		return l
 	end
 
+	-- RFC 3875 §6.3.3：Status 行**可选**，缺失时缺省 200 OK。
+	--
+	-- 上游 OpenClash 成片的 action_* 只是 `return SYS.call("...")`，既不调
+	-- HTTP.status() 也不 write —— CGI 输出是「0 字节」，而 0 字节在 CGI 语义里
+	-- 就是**成功**（这是 CGI 的约定，不是异常）。真机证据（2026-10-02）：
+	--   close_all_connection / reload_firewall / del_log / del_start_log /
+	--   restore 全部输出 0 字节；旧实现回 502 且响应体恰好 21 字节
+	--   "cgi missing Status: \n"—— 把正常动作误报成网关错误。
+	--
+	-- 所以「读不到第一行」**不能**直接判502：那与「CGI 启动失败」不可区分。
+	-- 正确做法是照常往下走（无 header → 无 body → 200），只有 fork 失败
+	-- 才是真 502（见上面的 io.popen 判据）。
 	local first = readline()
-	if not first then
-		ph:close()
-		os.remove(envf); os.remove(wrapper)
-		if bodyf then os.remove(bodyf) end
-		return send_status(sock, 502, {["Content-Type"]="text/plain"}, "cgi empty\n")
-	end
 
-	local code, reason = first:match("^Status:%s+(%d+)%s+(.*)%s*$")
-	if not code then
-		ph:close()
-		os.remove(envf); os.remove(wrapper)
-		if bodyf then os.remove(bodyf) end
-		-- 兼容 Status-less: 视为 body 的一部分，回 502
-		return send_status(sock, 502, {["Content-Type"]="text/plain"}, "cgi missing Status: " .. first .. "\n")
-	end
-
+	-- Status 行是**可选**的（RFC 3875 §6.3.3 明确允许）：
+	--   "A Status: header is not required. If absent, the server should assume
+	--    a 200 OK status."
+	-- 上游 OpenClash 大量 action_* 走 LuCI 的 HTTP.status() 显式设码（→ 有
+	-- Status 行），但**成片**的 action_* 只是 `return SYS.call("...")` 或
+	-- 直接落函数体，既不调 HTTP.status() 也不 write 任何东西 —— 它们的
+	-- CGI 输出是「0 字节」（成功即无输出，这是 CGI 的约定）。
+	-- 之前这里把「无 Status 行」判成 502 并把首行当错误信息吐回去，导致
+	-- close_all_connection / reload_firewall / del_log / del_start_log /
+	-- restore / core_download 等**语义正常**的端点全部 502。
+	-- 真机证据：502 响应体恰好 21 字节 "cgi missing Status: \n"。
+	--
+	-- 正确处置：把「首行是否 Status:」当作解析循环里的第一个判断，
+	-- 而不是前置分支 —— 这样 Status-less 的输出（含Location / Set-Cookie
+	-- 等普通 header）走的是**同一条**解析路径，不会漏header。
 	local headers = {}
-	while true do
-		local line = readline()
-		if not line or line == "" then break end
-		local k, v = line:match("^([^:]+):%s*(.*)$")
-		if k then
-			-- v 中可能含尾部空白（\r 已剥，但 \t 与尾部空格是合法的 header 折叠）
-			headers[k] = v
+	local code, reason
+
+	local line = first
+	while line do
+		line = line:gsub("^%s+", "")
+		if line:match("^Status:") then
+			code, reason = line:match("^Status:%s+(%d+)%s*(.*)$")
+		else
+			local k, v = line:match("^([^:]+):%s*(.*)$")
+			if k then
+				-- v 中可能含尾部空白（\r 已剥，但 \t 与尾部空格是合法的 header 折叠）
+				headers[k] = v
+			end
 		end
+		line = readline()
+		if not line or line == "" then break end
 	end
+	code = tonumber(code) or 200
+
 	local body = ph:read("*a") or ""
 	ph:close()
 	os.remove(envf); os.remove(wrapper)
@@ -622,7 +644,6 @@ local function run_cgi(sock, req, path_info)
 	for k, v in pairs(headers) do
 		if k ~= "Status" then out_headers[k] = v end
 	end
-	code = tonumber(code) or 200
 
 	-- 6. 转发：HEAD 时丢 body
 	if req.method == "HEAD" then

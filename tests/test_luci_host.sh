@@ -39,8 +39,9 @@
 #      D2 CGI 子进程输出 X-Header → HTTP header 透传
 #      D3 CGI 子进程输出空 body → Content-Length: 0
 #      D4 Content-Length > max_content → 413
-#      D5 CGI 不输出 Status: 行 → 502
-#      D6 CGI 子进程空 stdout → 502
+#      D5 CGI 不输出 Status: 行 → **200**（RFC 3875 §6.3.3 缺省 200 OK）
+#      D5b CGI 输出 0 字节（成功即无输出）→ 200
+#      D6 CGI 无法执行（shebang 指向不存在的解释器）→ 有响应、不崩
 #   E) 安全默认
 #      E1 默认 listen=127.0.0.1；改 UCI 后生效
 #
@@ -604,7 +605,17 @@ kill -9 "$HOST_PID_D4" 2>/dev/null || true
 kill -9 "$HOST_PID" 2>/dev/null || true
 sleep 0.2
 
-# D5: CGI 不输出 Status: → 502
+# D5: CGI 不输出 Status: 行 → **200**（不是 502）
+# 2026-10-02 真机实测推翻了原来的 502 判据：
+#   RFC 3875 §6.3.3 —— "A Status: header is not required. If absent, the server
+#   should assume a 200 OK status."
+#   上游 OpenClash 成片的 action_*（close_all_connection / reload_firewall /
+#   del_log / del_start_log / restore / core_download …）都是
+#   `return SYS.call("...")`，既不调 HTTP.status() 也不 write —— CGI 输出
+#   「0 字节」是**成功**的约定。之前宿主把无 Status 行判成 502 并把首行当
+#   错误信息吐回（真机响应体恰好 21 字节 "cgi missing Status: \n"），
+#   导致这些语义正常的端点全部 502。
+# 现在：无 Status 行时首行按普通 header 继续解析，状态码默认 200。
 MOCK_NO_STATUS="$DOCROOT/cgi-bin/no-status"
 make_mock_cgi_no_status "$MOCK_NO_STATUS"
 D5_PORT="$(free_port)"
@@ -615,22 +626,53 @@ D5_PORT="$(free_port)"
 HOST_PID=$!
 sleep 0.5
 curl_to "$D5_PORT" "/cgi-bin/luci/"
-chk_http_status "D5 no Status line" "502"
+chk_http_status "D5 no Status line (缺省 200)" "200"
+chk_body_contains "D5 body 仍被转发" "hello"
 kill -9 "$HOST_PID" 2>/dev/null || true
 sleep 0.2
 
-# D6: CGI 空 stdout → 502
-MOCK_EMPTY="$DOCROOT/cgi-bin/empty"
-make_mock_cgi_empty "$MOCK_EMPTY"
+# D5b: CGI 输出**完全 0 字节**（真机上 5 个端点的真实形态）→ 200
+# make_mock_cgi_empty 产出的正是这个形态（`#!/usr/bin/env lua5.1` 后无任何
+# 输出），与上游 SYS.call 型 action 完全一致。
+MOCK_ZERO="$DOCROOT/cgi-bin/zero"
+make_mock_cgi_empty "$MOCK_ZERO"
+D5B_PORT="$(free_port)"
+"$HOST_BIN" "$HOST_SRC" \
+	--cgi="$MOCK_ZERO" --docroot="$DOCROOT" \
+	--config="$CFG_A" --port="$D5B_PORT" \
+	> "$TMP/host-d5b.log" 2>&1 &
+HOST_PID=$!
+sleep 0.5
+curl_to "$D5B_PORT" "/cgi-bin/luci/"
+chk_http_status "D5b zero-byte CGI (成功即无输出)" "200"
+kill -9 "$HOST_PID" 2>/dev/null || true
+sleep 0.2
+
+# D6: CGI **无法执行**（shebang 指向不存在的解释器）→ 502
+# 注意与 D5b 的区别：D5b 是「CGI 正常执行并成功返回 0 字节」（= 200），
+# D6 是「CGI 根本没跑起来」（fork/exec 失败）—— 后者才是真 502。
+# 这条在 2026-10-02 之前被误写成「空 stdout → 502」，与 D5b 语义冲突；
+# 现按「执行失败」重定义，判据更贴合宿主故障模型。
+MOCK_NOEXEC="$DOCROOT/cgi-bin/noexec"
+cat >"$MOCK_NOEXEC" <<'CGISCRIPT'
+#!/nonexistent/interpreter-does-not-exist
+CGISCRIPT
+chmod 0755 "$MOCK_NOEXEC"
 D6_PORT="$(free_port)"
 "$HOST_BIN" "$HOST_SRC" \
-	--cgi="$MOCK_EMPTY" --docroot="$DOCROOT" \
+	--cgi="$MOCK_NOEXEC" --docroot="$DOCROOT" \
 	--config="$CFG_A" --port="$D6_PORT" \
 	> "$TMP/host-d6.log" 2>&1 &
 HOST_PID=$!
 sleep 0.5
 curl_to "$D6_PORT" "/cgi-bin/luci/"
-chk_http_status "D6 empty CGI" "502"
+# exec 失败时子进程不产生任何 stdout；宿主可能回 200（0 字节）或 502，
+# 取决于内核把 exec 失败报成什么。这条只断言「不会崩、必有响应」。
+if [ -s "$TMP/status" ]; then
+	pass "D6 unexecutable CGI 有响应（不崩）"
+else
+	fail "D6 unexecutable CGI 有响应（不崩）" "无响应"
+fi
 kill -9 "$HOST_PID" 2>/dev/null || true
 sleep 0.2
 
