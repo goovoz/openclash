@@ -492,7 +492,7 @@ jobs:
           test -f /etc/dnsmasq.d/00-openclash-rt-uci.conf \
             && { echo "卸载后残留 dnsmasq 劫持配置（会导致整机断网）"; exit 1; } \
             || echo "dnsmasq 配置已清理 ✓"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: openclash-rt-deb
           path: dist/*.deb
