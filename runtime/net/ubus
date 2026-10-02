@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# =============================================================================
+# openclash-rt  ubus 命令垫片（拦截 `call service list`，其余透传真 ubus）
+# -----------------------------------------------------------------------------
+# 为什么需要：
+#   OpenClash 的 watchdog（openclash_watchdog.sh:211）与订阅更新
+#   （openclash_update.sh:442）用
+#       ubus call service list '{"name":"openclash"}'
+#   检查内核/任务是否在运行。但 `service` 对象由**真 procd** 注册，本项目用
+#   systemd 替代 procd（见 docs/02 路线 B），系统里永远没有 procd 的 service
+#   对象 → `ubus call service list` 返回 "Command failed: Not found" →
+#   jsonfilter 拿到空 → watchdog 误判「内核没运行」→ enable=0 + stop，
+#   把刚启动的内核杀掉（P5 实测：Start Successful 后 15 秒 Mihomo shutting down）。
+#
+# 本垫片只拦截这一种调用，用进程存在性回答「是否 running」：
+#   · name=openclash        → pidof clash 非空则 running=true
+#   · name=openclash_update → pidof openclash_update 非空则 running=true
+# 其余一切 ubus 调用原样透传给真 /usr/bin/ubus（ubusd/rpcd 若在跑，行为不变）。
+#
+# 用法：
+#   ubus call service list '{"name":"openclash"}'
+#   ubus list                    # 透传
+#   ubus call uci get ...        # 透传
+#
+# 环境变量：
+#   OPENCLASH_RT_UBUS_REAL  真 ubus 客户端路径，默认 /usr/lib/openclash-rt/ubus.real
+# =============================================================================
+set -u
+
+REAL="${OPENCLASH_RT_UBUS_REAL:-/usr/lib/openclash-rt/ubus.real}"
+
+# 只拦截 `call service list`；其余透传
+if [ "$#" -lt 3 ] || [ "$1" != "call" ] || [ "$2" != "service" ] || [ "$3" != "list" ]; then
+	if [ -x "$REAL" ]; then
+		exec "$REAL" "$@"
+	fi
+	exit 1
+fi
+
+# 解析 --name / JSON 参数里的 name
+# watchdog/update 的调用形态：ubus call service list '{"name":"openclash"}'
+NAME=""
+for arg in "$@"; do
+	case "$arg" in
+		*'"name"'*)
+			# 从 {"name":"openclash"} 或 {"name": "openclash"} 提取值
+			NAME=$(printf '%s' "$arg" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+			;;
+	esac
+done
+
+# 判断进程是否在跑
+RUNNING="false"
+case "$NAME" in
+	openclash)
+		[ -n "$(pidof clash 2>/dev/null)" ] && RUNNING="true"
+		;;
+	openclash_update)
+		[ -n "$(pidof openclash_update.sh 2>/dev/null)" ] && RUNNING="true"
+		;;
+	*)
+		# 其它 service 名：交给真 ubus（若在跑）
+		if [ -x "$REAL" ]; then
+			exec "$REAL" "$@"
+		fi
+		RUNNING="false"
+		;;
+esac
+
+# 输出 procd service list 的 JSON 形态：
+#   {"openclash":{"instances":{"instance1":{"running":true}}}}
+# jsonfilter -e '@.openclash.instances.*.running' 能提取到 true
+printf '{"%s":{"instances":{"instance1":{"running":%s}}}}\n' "$NAME" "$RUNNING"
+exit 0

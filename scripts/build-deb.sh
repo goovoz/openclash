@@ -417,6 +417,20 @@ else
 	log "SKIP_UBUS_BUILD=1，跳过 ubus 底座（打出的包前端与上游 Lua 脚本都跑不起来）"
 fi
 
+# 5a2) ubus 命令垫片（拦截 `call service list`，其余透传真 ubus）
+# ----------------------------------------------------------------------------
+# 上游 watchdog/订阅更新用 `ubus call service list '{"name":"openclash"}'`
+# 检查内核是否运行，但 `service` 对象由真 procd 注册，本项目用 systemd 替代
+# procd，永远没有该对象 → 真 ubus 返回 "Command failed: Not found" →
+# watchdog 误判内核没运行 → enable=0 + stop 杀掉刚启动的内核（P5 实测）。
+# 垫片用进程存在性（pidof clash）回答 running，其余调用透传真 ubus。
+# 真 ubus 客户端移到 /usr/lib/openclash-rt/ubus.real，垫片 exec 它。
+if [ -f "$STAGE/usr/bin/ubus" ]; then
+	mkdir -p "$STAGE/usr/lib/openclash-rt"
+	mv "$STAGE/usr/bin/ubus" "$STAGE/usr/lib/openclash-rt/ubus.real"
+	install -D -m 0755 "$ROOT/runtime/net/ubus" "$STAGE/usr/bin/ubus"
+fi
+
 # 5b) Lua C 模块 + 搜索路径桥接（P1）
 #     LuCI 的纯 Lua 代码**不能**脱离 C 扩展运行：nixio / lucihttp / luci.ip /
 #     luci.jsonc / template.parser 都是模块顶层 `require`，少一个整站起不来。
