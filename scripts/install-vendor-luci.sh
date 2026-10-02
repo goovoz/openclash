@@ -115,6 +115,31 @@ done
 [ -d "$SRC/luci-compat/root/usr/share/rpcd/acl.d" ] && \
 	cp -a "$SRC/luci-compat/root/usr/share/rpcd/acl.d/." "$STAGE/usr/share/rpcd/acl.d/"
 
+# 3a) 给 luci-base.json 的 ubus.uci write 授权补 "commit"
+#   上游 vendor luci-base.json 的 ubus.uci write 只授权 add/apply/confirm/
+#   delete/order/rename/set（现代 LuCI 用 apply 而非 commit）。但 OpenClash
+#   前端（settings.lua 大量 m.uci:commit("openclash") + JS 普通字段保存）直接
+#   调 uci.commit，走 LuCI 的 admin/ubus 桥接，桥接层 ubus_access 查
+#   scope=ubus/object=uci/function=commit → vendor 未授权 → 浏览器保存配置
+#   报 -32002 Access denied（P5 用户实测：切选项/选订阅/点 Add 全不生效）。
+#   这里在 vendor 落位后补上 commit（vendor 层适配，不碰 L1 上游 OpenClash）。
+if [ -f "$STAGE/usr/share/rpcd/acl.d/luci-base.json" ]; then
+	if command -v python3 >/dev/null 2>&1; then
+		python3 - "$STAGE/usr/share/rpcd/acl.d/luci-base.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+w = d.setdefault("luci-base", {}).setdefault("write", {}).setdefault("ubus", {}).setdefault("uci", [])
+if "commit" not in w:
+    w.append("commit")
+json.dump(d, open(p, "w"), indent="\t", ensure_ascii=False)
+open(p, "a").write("\n")
+PYEOF
+	else
+		sed -i 's/"set"/"set", "commit"/' "$STAGE/usr/share/rpcd/acl.d/luci-base.json"
+	fi
+fi
+
 # 3) CGI 入口与 rpcd 辅助脚本：必须用 --file 模式钉 shebang
 #   这两个文件**没有扩展名**，--dir 模式按 EXTS 过滤会跳过它们。
 #   先复制（install -m 0755 让权限正确），再钉 shebang —— 顺序不能倒

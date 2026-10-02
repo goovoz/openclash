@@ -42,6 +42,9 @@ RestartSec=5
 # 3) ProtectHome=true：/home、/run/user 只读
 # 4) RestrictNamespaces / RestrictRealtime / LockPersonality
 # 5) RestrictAddressFamilies AF_UNIX（ubusd）+ AF_INET（监听）+ AF_INET6
+#    + AF_NETLINK：nixio.getifaddrs() 底层用 netlink 枚举接口，
+#    luci.model.network（Plugin Settings 等页面）依赖它。缺 AF_NETLINK 会
+#    network.lua:329 "ipairs (table expected, got nil)"（P5 用户实测追出）。
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
@@ -53,7 +56,7 @@ RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
 ProtectHostname=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
