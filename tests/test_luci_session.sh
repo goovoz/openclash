@@ -138,6 +138,46 @@ ok("A5 返回 data.username", r2 and r2.data and r2.data.username == "root")
 local ag = r2 and r2.acls and r2.acls["access-group"]
 ok("A6 access-group 含 luci-app-openclash", ag and ag["luci-app-openclash"] ~= nil)
 
+-- T/U access 的 rpcd 双形态语义（P5 用户浏览器实测追出的缺陷）
+-- 旧实现：access 恒返回 ACL 表 → 桥接的 res.access 恒 nil → 所有浏览器
+-- RPC 全部 -32002 → 登录页弹 "Session expired"。正确语义：
+--   带 scope/object/function → {access=bool}；不带 → ACL 表。
+local ANON = "00000000000000000000000000000000"
+
+-- T1 匿名 session.access（unauthenticated.json 授权）→ 调用成功 access=true
+local t1 = session.access({ubus_rpc_session=ANON, scope="ubus", object="session", ["function"]="access"})
+ok("T1 匿名 ubus.session.access 放行", type(t1)=="table" and t1.access == true,
+   "access="..tostring(t1 and t1.access))
+
+-- T2 匿名 luci.getFeatures（luci-base.json 的 unauthenticated 组授权）
+local t2 = session.access({ubus_rpc_session=ANON, scope="ubus", object="luci", ["function"]="getFeatures"})
+ok("T2 匿名 ubus.luci.getFeatures 放行", type(t2)=="table" and t2.access == true,
+   "access="..tostring(t2 and t2.access))
+
+-- T3 匿名 uci 读 → 拒（access=false），但**调用必须成功**（不报 NOT_FOUND，
+--    否则 luci.js 拦截器 .catch(notifySessionExpiry) 弹窗）
+local t3ok, t3 = pcall(session.access, {ubus_rpc_session=ANON, scope="uci", object="luci", ["function"]="read"})
+ok("T3 匿名 uci 读拒绝但调用成功", t3ok and type(t3)=="table" and t3.access == false,
+   "access="..tostring(type(t3)=="table" and t3.access or tostring(t3)))
+
+-- T4 匿名不带 scope → 返回 ACL 表（session_retrieve 的 sacl 消费形态）
+local t4 = session.access({ubus_rpc_session=ANON})
+ok("T4 匿名无 scope 返回 ACL 表", type(t4)=="table" and type(t4["access-group"])=="table"
+   and t4["access-group"]["unauthenticated"] ~= nil)
+
+-- U1 root 登录后 ubus.session.access → access=true（桥接放行前提）
+if sid then
+  local u1 = session.access({ubus_rpc_session=sid, scope="ubus", object="session", ["function"]="access"})
+  ok("U1 root ubus.session.access 放行", type(u1)=="table" and u1.access == true,
+     "access="..tostring(u1 and u1.access))
+
+  -- U2 root uci.openclash.read → access=true（luci-app-openclash.json）
+  local u2 = session.access({ubus_rpc_session=sid, scope="uci", object="openclash", ["function"]="read"})
+  ok("U2 root uci.openclash.read 放行", type(u2)=="table" and u2.access == true,
+     "access="..tostring(u2 and u2.access))
+end
+
+
 -- B/C/E get/set/destroy
 if sid then
   local g = session.get({ubus_rpc_session=sid})

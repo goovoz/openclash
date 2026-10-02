@@ -279,6 +279,38 @@ local function build_acls(login)
 	return acls
 end
 
+-- rpcd 语义的 ACL 判定（session.c:session_access 的 access 子检查）：
+-- 给定 scope/object/function，在扁平 ACL 表里查 obj（glob 通配）下的 func
+-- 列表（glob 通配）。命中任一 → true。
+local function acl_check(acls, scope, object, func)
+	if type(acls) ~= "table" then return false end
+	local objs = acls[scope]
+	if type(objs) ~= "table" then return false end
+	for objname, funcs in pairs(objs) do
+		if glob_match(objname, object) then
+			if funcs == true then return true end
+			if type(funcs) == "table" then
+				for _, fn in ipairs(funcs) do
+					if fn == func or glob_match(fn, func) then return true end
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- 匿名会话（rpcd 内置 000...0，ACL 组 = unauthenticated）。
+-- 上游 rpcd 启动即创建它，前端登录页的 session.access 探测全靠它：
+-- access 调用必须**成功返回** {access:false}（而不是 NOT_FOUND 报错），
+-- 否则 luci.js 的 -32002 拦截器 .catch(notifySessionExpiry) 会在登录页
+-- 弹 "Session expired"（P5 用户浏览器实测踩坑）。
+local ANON_SID = "00000000000000000000000000000000"
+
+local function build_acls_for_groups(groups)
+	-- 伪 login 段：read/write 都含给定组，复用 build_acls 的组过滤
+	return build_acls({ read = groups, write = groups })
+end
+
 -- -----------------------------------------------------------------------------
 -- §G session 方法实现
 -- -----------------------------------------------------------------------------
@@ -332,18 +364,34 @@ function M.get(data)
 	return { values = sess.values or { username = sess.username } }
 end
 
--- access(ubus_rpc_session) → { <scope> = { <obj> = [func] }, access-group = ... }
+-- access(ubus_rpc_session [, scope, object, function])
+--   rpcd 双形态语义（对齐 session.c 的 session access 方法 + dispatcher 用法）：
+--   · 带 scope/object/function → { access = true/false }
+--     （controller/admin/index.lua 的 ubus 桥接与 dispatcher has_uci_access 消费）
+--   · 不带 → 返回完整 ACL 表（dispatcher session_retrieve 的 sacl 消费）
+--   匿名会话（000...0）永远成功返回（unauthenticated 组），绝不 NOT_FOUND。
 function M.access(data)
-	local sess = load_session(data.ubus_rpc_session)
-	if not sess then
-		return nil, 3, "NOT_FOUND"
+	local sid = data.ubus_rpc_session
+	local scope, object, func = data.scope, data.object, data["function"]
+
+	local acls
+	if sid == ANON_SID then
+		acls = build_acls_for_groups({ "unauthenticated" })
+	else
+		local sess = load_session(sid)
+		if not sess then
+			return nil, 3, "NOT_FOUND"
+		end
+		-- 重新按 username 构建 ACL（会话可能跨进程，login 段可能已变）
+		local login = find_login(sess.username, nil)
+		acls = (login and build_acls(login)) or {}
 	end
-	-- 重新按 username 构建 ACL（会话可能跨进程，login 段可能已变）
-	local login = find_login(sess.username, nil)
-	if not login then
-		return {}
+
+	if not scope or not object or not func then
+		return acls
 	end
-	return build_acls(login)
+
+	return { access = acl_check(acls, scope, object, func) }
 end
 
 -- set(ubus_rpc_session, values) → 空
