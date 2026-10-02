@@ -45,8 +45,12 @@ RestartSec=5
 #    + AF_NETLINK：nixio.getifaddrs() 底层用 netlink 枚举接口，
 #    luci.model.network（Plugin Settings 等页面）依赖它。缺 AF_NETLINK 会
 #    network.lua:329 "ipairs (table expected, got nil)"（P5 用户实测追出）。
+# 6) ★ ProtectSystem=true 而非 full：full 会把 /etc 也设只读，导致 LuCI 前端
+#    uci commit 写 /etc/config/* 静默失败（cursor.commit 被 pcall 吞掉错误），
+#    表现为「切选项/选订阅/点 Add 全不生效、刷新即丢」。true 只读 /usr /boot
+#    /efi，/etc 保持可写，uci commit 才能落盘（P5 用户实测追出）。
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=true
 PrivateTmp=true
 ProtectHome=true
 ProtectKernelTunables=true
