@@ -295,11 +295,22 @@ jobs:
           # 打包期已改写；这里确认它真的落到了系统的 /usr/share/openclash。
           # 宽判据与 runtime/upstream/pin-lua-interpreter.sh 的 RESIDUAL_RE 同源。
           LUA_GATE='^#![[:space:]]*.*lua[[:space:]]*$|(^|[^[:alnum:]_./-])lua([^[:alnum:]_.-]|$)'
-          n_sb="$(grep -rlE '^#!/usr/bin/lua5\.1$' /usr/share/openclash 2>/dev/null | wc -l)"
+          # ⚠️ 计数必须加 `|| true`：grep 无匹配时返回 1，配合 set -o pipefail
+          #   会让 `n="$(grep ... | wc -l)"` 整条命令替换返回非 0，set -e 在**赋值
+          #   这行**就静默退出 —— 既不打 error 也不显示 n 的值，极难排障。
+          #   加 `|| true` 后，即使 grep 无匹配，n 也能拿到 0，走到下面的
+          #   `[ "$n" -eq 8 ] || { echo error; exit 1; }` 打出真实数值。
+          n_sb="$(grep -rlE '^#!/usr/bin/lua5\.1$' /usr/share/openclash 2>/dev/null | wc -l || true)"
+          n_sb="$(echo "$n_sb" | tr -d ' ')"
+          echo "  n_sb（shebang 指向 lua5.1 的文件数）=$n_sb"
           [ "$n_sb" -eq 8 ] || { echo "::error::shebang 指向 lua5.1 的文件数为 $n_sb，期望 8"; exit 1; }
-          n_calls="$(grep -rhoE '/usr/bin/lua5\.1 /usr/share/openclash/' /usr/share/openclash 2>/dev/null | wc -l)"
+          n_calls="$(grep -rhoE '/usr/bin/lua5\.1 /usr/share/openclash/' /usr/share/openclash 2>/dev/null | wc -l || true)"
+          n_calls="$(echo "$n_calls" | tr -d ' ')"
+          echo "  n_calls（显式调用改写处数）=$n_calls"
           [ "$n_calls" -eq 3 ] || { echo "::error::显式调用改写的处数为 $n_calls，期望 3"; exit 1; }
-          n_left="$(grep -rlE "$LUA_GATE" /usr/share/openclash 2>/dev/null | wc -l)"
+          n_left="$(grep -rlE "$LUA_GATE" /usr/share/openclash 2>/dev/null | wc -l || true)"
+          n_left="$(echo "$n_left" | tr -d ' ')"
+          echo "  n_left（仍残留裸 lua 的文件数）=$n_left"
           [ "$n_left" -eq 0 ] || {
             echo "::error::仍有 $n_left 个文件存在裸 lua 依赖："
             grep -rnE "$LUA_GATE" /usr/share/openclash | head -10
