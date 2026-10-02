@@ -145,8 +145,45 @@ case "${1:-}" in
 		if [ -x /usr/share/openclash/uci-defaults/luci-openclash ]; then
 			if ! "$UCI_BIN" -q get openclash.@authentication[0] >/dev/null 2>&1; then
 				log "running upstream uci-defaults"
-				sh /usr/share/openclash/uci-defaults/luci-openclash >/dev/null 2>&1 || \
-					log "uci-defaults 返回非零（可忽略，可稍后从 Web UI 触发）"
+				# ⚠️ 必须用 **bash**，不能用 sh。
+				# 上游 uci-defaults:79 是 `source "/etc/openwrt_release"`，而
+				# `source` 是 **bash 内建**，dash（Debian 的 /bin/sh）没有它 ——
+				# sh 下会报 "source: not found" 并**继续往下跑**，于是
+				# DISTRIB_ARCH 为空 → case 落到 *) → CORE_ARCH="0" →
+				# core_version 被写成 0 → 内核下载 URL 变成 clash-0.tar.gz（404）。
+				# 真机实测（2026-10-02，Debian 12 @ 172.20.0.101）：
+				#   sh   → core_version=0（下载永远失败）
+				#   bash → core_version=linux-amd64-v1（下载成功，13.19MB）
+				if [ -x /bin/bash ]; then
+					/bin/bash /usr/share/openclash/uci-defaults/luci-openclash >/dev/null 2>&1 || \
+						log "uci-defaults 返回非零（可忽略，可稍后从 Web UI 触发）"
+				else
+					sh /usr/share/openclash/uci-defaults/luci-openclash >/dev/null 2>&1 || \
+						log "uci-defaults 返回非零（可忽略，可稍后从 Web UI 触发）"
+				fi
+			fi
+		fi
+
+		# ---- core_version 兜底：守卫条件可能跳过 uci-defaults -----------
+		# 上面的守卫是「没有 authentication 段才跑」。但有两种情况会留下
+		# core_version=0：
+		#   a) 全新安装时authentication 段已由别的路径写过；
+		#   b) uci-defaults 用 sh 跑失败（见上）。
+		# core_version=0 会让内核下载 URL 变成 clash-0.tar.gz —— 必然 404，
+		# 且界面上只表现为「下载失败」，极难定位。
+		# 这里用 openwrt-release.sh --core-arch 兜底（它与上游 uci-defaults
+		# 的 case 逐字对拍过），只在该项为空或为 0 时写。
+		if [ -x /usr/lib/openclash-rt/openwrt-release.sh ] && [ -x "$UCI_BIN" ]; then
+			CUR_CV="$("$UCI_BIN" -q get openclash.config.core_version 2>/dev/null || true)"
+			if [ -z "$CUR_CV" ] || [ "$CUR_CV" = "0" ]; then
+				CV_FIX="$(/usr/lib/openclash-rt/openwrt-release.sh --core-arch 2>/dev/null || true)"
+				if [ -n "$CV_FIX" ] && [ "$CV_FIX" != "0" ]; then
+					"$UCI_BIN" -q set openclash.config.core_version="$CV_FIX" && \
+						"$UCI_BIN" -q commit openclash && \
+						log "core_version was 0, recovered to $CV_FIX"
+				else
+					log "core_version 无法自动推导（该架构无可下载内核），需在 Web UI 手工指定"
+				fi
 			fi
 		fi
 
