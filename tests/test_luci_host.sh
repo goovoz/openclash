@@ -737,8 +737,9 @@ else
 	fail "N1 luci-host 判据用 reg" "源码里未找到 == reg，可能被改回 regular"
 fi
 
-# N2: 行为断言——nixio.fs.stat 对普通文件返回 "reg"
-N2_OUT=$(lua5.1 -e 'local nf=require("nixio.fs"); print(nf.stat("/etc/config/openclash-rt", "type") or "nil")' 2>/dev/null)
+# N2: 行为断言——nixio.fs.stat 对普通文件返回 "reg"（用 /etc/passwd 等恒存在
+#     文件；不能用 /etc/config/openclash-rt，CI 的 unit job 没装 deb 该文件不存在）
+N2_OUT=$(lua5.1 -e 'local nf=require("nixio.fs"); print(nf.stat("/etc/passwd", "type") or "nil")' 2>/dev/null)
 if [ "$N2_OUT" = "reg" ]; then
 	pass "N2 nixio.fs.stat 返回 reg"
 else
