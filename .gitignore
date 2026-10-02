@@ -21,4 +21,5 @@ vendor/.ubus-checkout/
 Thumbs.db
 .vscode/
 .idea/
-*.swp.ui-shots/
+*.swp
+.ui-shots/
