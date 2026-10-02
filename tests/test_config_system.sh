@@ -40,10 +40,14 @@ BUILD_DEB="$ROOT/scripts/build-deb.sh"
 CONFFILES="$ROOT/packaging/debian/conffiles"
 UPSTREAM_LUA="$ROOT/upstream/luci-app-openclash/luasrc/controller/openclash.lua"
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 it()  { printf '\n\033[1m── %s\033[0m\n' "$1"; }
 ok()  { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 no()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; }
+# SKIP 用于「前置条件不具备」而非「行为错误」的断言。
+# 与 FAIL 的区别很重要：CI 里缺 upstream/ 是正常状态（shallow clone），
+# 判 FAIL 会让红绿灯失去意义（2026-10-02踩过）。
+skip() { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m  %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; }
 chk() { if [ "$2" = "$3" ]; then ok "$1"; else no "$1" "want=[$3] got=[$2]"; fi; }
 
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
@@ -166,7 +170,13 @@ if [ -f "$UPSTREAM_LUA" ]; then
 		   "上游 openclash.lua 里没找到该取法，可能已改名/重构 —— 请复核 device_name 来源"
 	fi
 else
-	no "找到上游 openclash.lua" "$UPSTREAM_LUA 不存在（是否忘了 sync-upstream？）"
+	# 上游源码不在（CI 的 shallow clone、或本地忘了 sync-upstream）时
+	# **不能判 FAIL** —— E1 是「判据未过期」的守卫，不是被测行为。
+	# 真正的被测行为是 E2（模板含所需字面量），它不依赖上游源码。
+	# 2026-10-02：真机跑 CI 模拟时因没带 upstream/ 目录而误报 FAIL，
+	# 改为 SKIP + 显式提示。E2 仍然会跑，核心判据不失守。
+	skip "上游 openclash.lua 不存在，跳过 E1 判据新鲜度检查" \
+	     "$UPSTREAM_LUA 未找到（CI shallow clone 或本地未 sync-upstream）；E2 仍会校验模板字面量"
 fi
 
 for token in 'config system' 'option hostname'; do
@@ -197,6 +207,8 @@ chk "已存在时不覆盖用户内容" "$(cat "$SYSFILE")" "$CUSTOM"
 
 # =============================================================================
 printf '\n════════════════════════════════════════\n'
-printf '  PASS: %d    FAIL: %d\n' "$PASS" "$FAIL"
+#摘要行用「空格」分隔，与 test_dns_prep / test_luci_host 等老套件一致，
+# 便于 tests/run-all.sh 的 awk 正则 PASS[ \t]*N + FAIL[ \t]*N 命中。
+printf '  PASS %d   FAIL %d   SKIP %d\n' "$PASS" "$FAIL" "$SKIP"
 printf '════════════════════════════════════════\n'
 [ "$FAIL" -eq 0 ]
