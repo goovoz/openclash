@@ -519,7 +519,10 @@ local function run_cgi(sock, req, path_info)
 	-- 崩溃 → mock CGI 全部 502。故只在文件真实存在时才注入（真机 dpkg 后
 	-- 文件必然存在，登录鉴权照常生效；CI staging 则自然跳过）。
 	local bootstrap_lua = "/usr/lib/openclash-rt/luci-session-bootstrap.lua"
-	if nixio_fs.stat(bootstrap_lua, "type") == "regular" then
+	-- nixio.fs.stat(path, "type") 返回的是 POSIX 短名 "reg"（不是 "regular"），
+	-- 目录是 "dir"。之前写 "regular" 恒不相等 → LUA_INIT 永不注入 → bootstrap
+	-- 不执行 → 登录页 500 "attempt to index 'boardinfo' (nil)"（P5 部署验证追出）。
+	if nixio_fs.stat(bootstrap_lua, "type") == "reg" then
 		setenv("LUA_INIT", "@" .. bootstrap_lua)
 	end
 
