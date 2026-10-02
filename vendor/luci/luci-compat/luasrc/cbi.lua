@@ -440,6 +440,65 @@ function Map.render(self, ...)
 	Node.render(self, ...)
 end
 
+-- [openclash-rt 适配] Map 层的 tab 支持
+--
+-- 现象（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+--   Plugin Settings 页（openclash/settings.lua）只渲染出 Lan Traffic
+--   Access List，15 个 tab 里的 279 个控件**一个都不出现**。
+--   对照ImmortalWrt 24.10（172.20.0.2）同页正常。
+--
+-- 根因（三环）：
+--   1) settings.lua:65 `s = m:section(TypedSection, ...)` → s 是
+--      AbstractSection，它**有** tab/taboption/render_tab
+--      （本文件 835/867/881 行），所以 s:tab(...) 15 次都成功、
+--      s:taboption(...) 把选项挂进 `s.tabs[tab].childs` ——数据是对的。
+--   2) 但 taboption 只写 `self.tabs[tab].childs`，**不append 到
+--      self.children**（对比 AbstractSection.option 走 self:append）。
+--   3) view/cbi/map.htm:13 判断 `<% if self.tabbed then %>`，而
+--      **self.tabbed 在本文件里从未被赋值**（全文件仅 1 处注释提到）。
+--      21.02 世代的 cbi.lua 没有这个标记，map.htm 却依赖它 →
+--      永远走 `<%- self:render_children() %>`，只渲染 Map.children
+--      → tab 里的选项全部丢失。
+--
+-- 即：cbi.lua（21.02）与 map.htm（更新版）不配版。
+--
+-- 修法：给 Map 补 has_tabs()（语义=任一 child section 有 tabs），
+-- 并把 map.htm 的判断改成 self:has_tabs()。不能直接让 map.htm 调
+-- AbstractSection.has_tabs —— Map = class(Node)，拿不到那个方法，
+-- 实测会报 `attempt to call method 'has_tabs' (a nil value)`。
+--
+-- 为什么 OpenWrt 上正常：ImmortalWrt 24.10 用的是支持 tab 的新版
+-- luci-base，Map.tabbed 存在，map.htm 的 tab 分支能走通。
+--
+-- 这属于 vendor 层适配（对齐新版 LuCI 行为），**不改上游 OpenClash 一行**。
+function Map.has_tabs(self)
+	for _, section in ipairs(self.children) do
+		if section and section.has_tabs and section:has_tabs() then
+			return true
+		end
+	end
+	return false
+end
+
+-- [openclash-rt 适配] 渲染 Map 下各 section 的 tab
+-- 供 view/cbi/map.htm 调用（21.02 的 map.htm 没有这段，是新版才有的）。
+-- 逐 tab 包一层 .cbi-tabcontainer，配合 cbi.js 的 tab 切换。
+function Map.render_tabcontainer(self, prefix)
+	for _, section in ipairs(self.children) do
+		if section and section.has_tabs and section:has_tabs() then
+			for _, tab in ipairs(section.tab_names or {}) do
+				local data = section.tabs and section.tabs[tab]
+				local tabid  = string.format("%s%s", prefix or "m",
+					section.section or section.sectiontype or "")
+				luci.template.render("cbi/tabcontainer", {
+					self = section, tab = tab, data = data or {},
+					section = tabid, scope = self,
+				})
+			end
+		end
+	end
+end
+
 -- Creates a child section
 function Map.section(self, class, ...)
 	if instanceof(class, AbstractSection) then

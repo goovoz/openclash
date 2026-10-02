@@ -10,19 +10,8 @@
 	<% if self.description and #self.description > 0 then %>
 		<div class="cbi-map-descr"><%=self.description%></div>
 	<% end %>
-	<% if self.tabbed then %>
-		<div>
-			<% for i, section in ipairs(self.children) do
-			       tab = section.section or section.sectiontype %>
-				<div class="cbi-tabcontainer"<%=
-					attr("id", "container.m-%s.%s" %{ self.config, tab }) ..
-					attr("data-tab", tab) ..
-					attr("data-tab-title", section.title or tab)
-				%>>
-					<% section:render() %>
-				</div>
-			<% end %>
-		</div>
+	<% if self:has_tabs() then %>
+		<% self:render_tabcontainer("m") %>
 
 		<% if not self.save then -%>
 			<div class="cbi-section-error">
