@@ -51,6 +51,27 @@ ADAPTER="${OPENCLASH_RT_ADAPTER:-$R/usr/lib/openclash-rt/dnsmasq-adapter.sh}"
 log() { printf '%s: %s\n' "$LOG_TAG" "$*" >&2; }
 
 # -----------------------------------------------------------------------------
+# 0. 开启 IP 转发（旁路由本职）
+# -----------------------------------------------------------------------------
+# 旁路由要转发局域网设备的流量，必须 net.ipv4.ip_forward=1。OpenWrt 路由器
+# 默认开启（路由器本职就是转发），Debian 默认关闭。不开启的话，局域网设备把
+# 网关指到旁路由后，流量到达旁路由但不会被转发出去，透明代理对"转发流量"
+# 完全失效（dstnat/prerouting 链只处理经过本机转发的包）。
+#
+# 注意：这是系统级 sysctl，不能用 $R 沙箱（测试时不该动真 sysctl）。用
+# OPENCLASH_RT_SKIP_SYSCTL=1 跳过（单测/CI 用）。
+if [ "${OPENCLASH_RT_SKIP_SYSCTL:-0}" != "1" ]; then
+	_cur=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+	if [ "$_cur" != "1" ]; then
+		if printf '1' > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then
+			log "已开启 net.ipv4.ip_forward=1（旁路由 IP 转发）"
+		else
+			log "无法写 /proc/sys/net/ipv4/ip_forward（非 root？），旁路由转发可能失效"
+		fi
+	fi
+fi
+
+# -----------------------------------------------------------------------------
 # 1. 让上游把 DNSMASQ_CONF_DIR 推导到 Debian 真实生效的目录
 # -----------------------------------------------------------------------------
 # 上游 init.d:16-22 的逻辑：
