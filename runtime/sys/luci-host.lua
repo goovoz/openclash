@@ -20,8 +20,11 @@
 --   H8  并发              max_requests=50 / max_connections=100（上游要求值）
 --   H9  子进程回收         CGI 超时 kill -TERM；客户端断开 → 子进程 stdin 关闭
 --                          → 上游脚本自然结束
---   H10 监听              默认 127.0.0.1:9090（安全默认；要外露必须显式改
+--   H10 监听              默认 127.0.0.1:9080（安全默认；要外露必须显式改
 --                          /etc/config/openclash-rt）
+--                          注意：**不用 9090**——9090 是上游 mihomo 内核的
+--                          external-controller 默认端口（cn_port），底层保持
+--                          上游一致不动，故宿主让位到 9080。
 --
 -- **单一职责**：解释 HTTP ↔ CGI 协议，**不**做认证、不**改写**上游 LuCI 的任何
 -- .lua / .htm。鉴权由 luci.dispatcher 自身的 session 模块处理（见 P4）。
@@ -54,7 +57,7 @@ local nixio_util = require("nixio.util")
 -- -----------------------------------------------------------------------------
 local DEFAULTS = {
 	listen        = "127.0.0.1",
-	port          = 9090,
+	port          = 9080,
 	cgi           = "/www/cgi-bin/luci",
 	docroot       = "/www",
 	config        = "/etc/config/openclash-rt",

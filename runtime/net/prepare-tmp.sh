@@ -140,6 +140,16 @@ mkdir -p "$R/etc/crontabs" 2>/dev/null || true
 [ -f "$R/etc/crontabs/root" ] || : >"$R/etc/crontabs/root"
 
 # -----------------------------------------------------------------------------
+# 3b. flock 锁目录
+# -----------------------------------------------------------------------------
+# 上游 15 个脚本用 `exec 8xx>/tmp/lock/<name>.lock` + `flock -x 8xx` 做互斥，
+# 目录本身在 OpenWrt 上由 procd/tmpfiles.d 自动创建，Debian 没有。缺失时
+# exec 重定向报 "No such file or directory"，flock 报 "Bad file descriptor"
+# —— 锁失效（但主流程因锁失败仍继续，属静默降级，订阅/内核下载照常成功）。
+# 补上目录让锁真正生效。
+mkdir -p "$R/tmp/lock" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
 # 4. core 软链（core 本体由用户在 Web UI 中自行下载）
 # -----------------------------------------------------------------------------
 mkdir -p "$R/etc/openclash/core" "$R/etc/openclash/custom" 2>/dev/null || true

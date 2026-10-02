@@ -12,7 +12,14 @@ N="
 "
 
 _C=0
-NO_EXPORT=1
+# NOTE: 上游 OpenWrt 这里写 NO_EXPORT=1，配合 export ${NO_EXPORT:+-n} 用
+# `export -n` 取消导出 CONFIG_* 中间变量。但 `export -n` 是 bash 扩展，
+# Debian 的 /bin/sh 是 dash、不支持，会报 "export: Illegal option -n"
+# （yml_change.sh source 本文件后，Step 3 阶段连爆 4 次，虽不致命但污染）。
+# dash 下 ${NO_EXPORT:+-n} 展开成 -n 直接炸。置空让展开为空字符串，
+# `export VAR=...` 正常导出——CONFIG_* 中间变量导出与否不影响 OpenClash
+# 功能（它用 uci_get_config 直读，不依赖导出态），且 dash/bash 均兼容。
+NO_EXPORT=
 LOAD_STATE=1
 LIST_SEP=" "
 

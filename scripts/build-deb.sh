@@ -534,8 +534,9 @@ done
 # 6b) LuCI HTTP 宿主单元（P3 自研件）—— 替代 uhttpd
 # ----------------------------------------------------------------------------
 # 为什么单独成一节：本单元是 openclash-rt **前端**的入口守护进程，对应 docs/02
-# §5.6 H1–H10 的完整职责。它**不**依赖 uhttpd：监听 127.0.0.1:9090，把 HTTP
+# §5.6 H1–H10 的完整职责。它**不**依赖 uhttpd：监听 127.0.0.1:9080，把 HTTP
 # 请求作为 CGI 喂给 /www/cgi-bin/luci（CGI 协议详见 sgi/cgi.lua）。
+# （9090 让位给 mihomo 内核的 external-controller，保持上游底层不动。）
 #
 # 安全默认（127.0.0.1）写在 unit 内部 --listen=127.0.0.1。要外露必须用户显式
 # 改 /etc/config/openclash-rt 的 main.listen（不建议在公网直接暴露；
@@ -545,18 +546,21 @@ cp "$ROOT/packaging/debian/openclash-rt-luci-host.service" \
 chmod 0644 "$STAGE/lib/systemd/system/openclash-rt-luci-host.service"
 
 # 7) 初始 UCI 配置（conffile）
+# ----------------------------------------------------------------------------
+# 直接复制上游的完整默认配置 upstream/.../root/etc/config/openclash，而不是
+# 手写精简版。上游这份含 65+ 个 option（proxy_mode='rule'、mixed_port、
+# http_port、socks_port、tproxy_port、log_level 等）+ 30 个 DNS 服务器段 +
+# config_overwrite 段。
+#
+# 为什么必须用完整版：yml_change.sh 在 Step 3 会用 Ruby 把 init.d 传来的
+# 位置参数（proxy_mode=${10}、mixed_port=${14} 等）回填到配置。若默认配置
+# 缺了 proxy_mode 等关键 option，uci_get_config 返回空 → yml_change 产出
+# `mode: ''` 空壳 → mihomo 报 "Parse config error: invalid mode"（P5 踩过）。
+# 上游这份是 OpenClash 官方默认，用它等于「不重造默认值」，后续同步上游
+# 也少一处漂移。
 if [ ! -f "$STAGE/etc/config/openclash" ]; then
-	cat >"$STAGE/etc/config/openclash" <<'EOF'
-config openclash 'config'
-	option enable '0'
-	option operation_mode 'fake-ip'
-	option en_mode 'fake-ip'
-	option en_mode_tun '1'
-	option core_type 'Meta'
-	option core_version '0'
-	option dns_port '7874'
-	option cn_port '9090'
-EOF
+	cp "$ROOT/upstream/luci-app-openclash/root/etc/config/openclash" \
+	   "$STAGE/etc/config/openclash"
 fi
 
 # 上游 init.d:16 必须能读到 dhcp.@dnsmasq[0]（匿名段），否则
@@ -685,13 +689,15 @@ install -m 0755 "$ROOT/packaging/debian/etc-init.d-uhttpd" \
 # 7f) /etc/config/openclash-rt —— 宿主自己的 UCI 配置（P3）
 # ----------------------------------------------------------------------------
 # LuCI 宿主读这份 main 段（listen/port/script_timeout/max_connections）。
-# 不存在时宿主用 DEFAULTS（127.0.0.1:9090 / 3600 / 100）。
+# 不存在时宿主用 DEFAULTS（127.0.0.1:9080 / 3600 / 100）。
 # 提供这份 conffile 的目的是让用户能**不改 unit 文件**地调整宿主行为。
+# 端口用 9080：9090 留给 mihomo external-controller（上游默认 cn_port），
+# 底层保持上游一致、避免同步上游时冲突。
 if [ ! -f "$STAGE/etc/config/openclash-rt" ]; then
 	cat >"$STAGE/etc/config/openclash-rt" <<'EOF'
 config openclash_rt 'main'
 	option listen '127.0.0.1'
-	option port '9090'
+	option port '9080'
 	option script_timeout '3600'
 	option max_connections '100'
 EOF

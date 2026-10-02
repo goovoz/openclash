@@ -17,7 +17,7 @@
 # 覆盖维度：
 #   A) 启动与监听
 #      A1 listen 默认 127.0.0.1
-#      A2 port 默认 9090
+#      A2 port 默认 9080
 #      A3 监听冲突立即 abort 不留位
 #      A4 /etc/config/openclash-rt 改 main.port 生效
 #   B) HTTP 路由
@@ -101,7 +101,7 @@ die() {
 TMP="$(mktemp -d -t ocrt-lucihost.XXXXXX)"
 trap 'cleanup' EXIT
 
-# 启动前清扫：上轮 run 残留的 luci-host.lua 会占住 9090，让本轮 A1 既
+# 启动前清扫：上轮 run 残留的 luci-host.lua 会占住 9080，让本轮 A1 既
 # "PASS by accident"（curl 连到旧进程）+ 日志断言 FAIL。这种残留来自
 # 外部手工跑 diag 时 nohup 起的进程（PID 不在 trap 里 kill）。
 pkill -9 -f luci-host.lua 2>/dev/null || true
@@ -111,7 +111,7 @@ cleanup() {
 	[ -n "${HOST_PID:-}" ] && kill -9 "$HOST_PID" 2>/dev/null || true
 	sleep 0.1
 	[ -n "${MOCK_PID:-}" ] && kill -9 "$MOCK_PID" 2>/dev/null || true
-	# 兜底：上轮 run 残留的 luci-host.lua 进程会跟本轮抢 9090，导致 A1
+	# 兜底：上轮 run 残留的 luci-host.lua 进程会跟本轮抢 9080，导致 A1
 	# "PASS by accident"（连到旧进程）+ 日志断言 FAIL。一律把所有
 	# 不在本进程组的 luci-host.lua 全清掉。
 	pkill -9 -f luci-host.lua 2>/dev/null || true
@@ -372,27 +372,27 @@ EOF
 HOST_PID=$!
 sleep 0.3
 A_PORT="$(free_port)"
-# 关掉这个（我们要看默认行为，但默认行为是 9090）
+# 关掉这个（我们要看默认行为，但默认行为是 9080）
 kill -9 "$HOST_PID" 2>/dev/null || true
 
-# 真正启：让它默认 9090，看 ss
+# 真正启：让它默认 9080，看 ss
 "$HOST_BIN" "$HOST_SRC" \
 	--cgi="$MOCK_CGI" --docroot="$DOCROOT" \
 	--config="$CFG_A" \
 	> "$TMP/host-a.log" 2>&1 &
 HOST_PID=$!
 sleep 0.5
-if (echo > "/dev/tcp/127.0.0.1/9090") 2>/dev/null; then
-	pass "A1 监听 9090（默认）"
+if (echo > "/dev/tcp/127.0.0.1/9080") 2>/dev/null; then
+	pass "A1 监听 9080（默认）"
 else
-	fail "A1 启不来（默认 9090）"
+	fail "A1 启不来（默认 9080）"
 fi
-chk_log_has "listening on 127.0.0.1:9090" "$TMP/host-a.log"
+chk_log_has "listening on 127.0.0.1:9080" "$TMP/host-a.log"
 
 # A3: 监听冲突 → 立即 abort 不留位
 "$HOST_BIN" "$HOST_SRC" \
 	--cgi="$MOCK_CGI" --docroot="$DOCROOT" \
-	--config="$CFG_A" --port=9090 \
+	--config="$CFG_A" --port=9080 \
 	> "$TMP/host-a3.log" 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
@@ -400,7 +400,7 @@ if [ "$RC" -ne 0 ]; then
 else
 	fail "A3 端口被占仍 accept（不应）"
 fi
-chk_log_has "bind 127.0.0.1:9090 failed" "$TMP/host-a3.log"
+chk_log_has "bind 127.0.0.1:9080 failed" "$TMP/host-a3.log"
 
 # A4: UCI 改 main.listen/port 生效
 CFG_A4="$TMP/uci-a4.conf"
@@ -675,12 +675,12 @@ M1_PID=$!
 sleep 0.5
 if (echo > "/dev/tcp/127.0.0.1/$M1_PORT") 2>/dev/null; then
 	# 此时 --port=$M1_PORT 应**无效**（变异去掉命令行），结果端口被冲突掉
-	# 但实际：DEFAULTS.port=9090，又因为 UCI 没 port，host 监听 9090 而不是 M1_PORT
-	# 故 M1_PORT 上根本 listen 不到 —— 反过来 M1_PORT=9090 才 fail
+	# 但实际：DEFAULTS.port=9080，又因为 UCI 没 port，host 监听 9080 而不是 M1_PORT
+	# 故 M1_PORT 上根本 listen 不到 —— 反过来 M1_PORT=9080 才 fail
 	if (echo > "/dev/tcp/127.0.0.1/M1_PORT") 2>/dev/null; then
 		fail "M1 变异没生效（还能连 M1_PORT）"
 	else
-		pass "M1 变异生效（命令行 --port 失效，监听默认 9090）"
+		pass "M1 变异生效（命令行 --port 失效，监听默认 9080）"
 	fi
 fi
 kill -9 "$M1_PID" 2>/dev/null || true
