@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Sync upstream
         id: sync
@@ -100,7 +100,7 @@ jobs:
 
       - name: Open issue on patch conflict
         if: steps.sync.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -139,7 +139,7 @@ jobs:
         # 后者更危险：工作流红掉但代码已经推进了一版，若不显式告知，
         # 下一个人只会看到「测试挂了」而不知道该去比哪一条适配。
         if: steps.sync.outcome == 'success' && steps.compat.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const title = `上游同步后兼容性回归 @ ${new Date().toISOString().slice(0,10)}`;
