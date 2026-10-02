@@ -722,6 +722,30 @@ kill -9 "$M3_PID" 2>/dev/null || true
 sleep 0.2
 
 # -----------------------------------------------------------------------------
+# N. LUA_INIT 注入判据（P4 回归守卫）
+# -----------------------------------------------------------------------------
+# P5 部署验证追出一个隐蔽 bug：nixio.fs.stat(path, "type") 返回 POSIX 短名
+# "reg"（不是 "regular"），而 luci-host.lua 里写的是 == "regular"，恒不相等 →
+# LUA_INIT 永不注入 → 登录页 500 "attempt to index boardinfo (nil)"。
+# 这里钉死两件事：① 源码判据必须是 "reg"；② nixio.fs.stat 确实返回 "reg"。
+log "N. LUA_INIT 注入判据"
+
+# N1: 静态断言——源码里 bootstrap 判据是 "reg" 而非 "regular"
+if grep -q 'nixio_fs.stat(bootstrap_lua, "type") == "reg"' "$HOST_SRC"; then
+	pass "N1 luci-host 判据用 reg（不是 regular）"
+else
+	fail "N1 luci-host 判据用 reg" "源码里未找到 == reg，可能被改回 regular"
+fi
+
+# N2: 行为断言——nixio.fs.stat 对普通文件返回 "reg"
+N2_OUT=$(lua5.1 -e 'local nf=require("nixio.fs"); print(nf.stat("/etc/config/openclash-rt", "type") or "nil")' 2>/dev/null)
+if [ "$N2_OUT" = "reg" ]; then
+	pass "N2 nixio.fs.stat 返回 reg"
+else
+	fail "N2 nixio.fs.stat 返回 reg" "got=$N2_OUT"
+fi
+
+# -----------------------------------------------------------------------------
 # 收尾
 # -----------------------------------------------------------------------------
 log "结果 PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
