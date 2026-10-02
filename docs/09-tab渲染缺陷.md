@@ -3,7 +3,8 @@
 > 状态：**已修复**（方案 B，commit 1f4a07f，2026-10-02）
 > 日期：2026-10-02
 > 真机：Debian 12 @ 172.20.0.101:9080（openclash-rt 0.47.156+ocrt1）
-> 对照：ImmortalWrt 24.10 @ 172.20.0.2（root/DAM%ms7f）
+> 对照：ImmortalWrt 24.10 @ 172.20.0.2（凭据走环境变量 `OCRT_OPENWRT_PWD`，
+> 见 `scripts/_deploy/credentials.py` —— **不要在仓库里写明文口令**）
 
 ## 1. 现象
 
