@@ -11,7 +11,7 @@ jobs:
     name: Lint (shellcheck)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint runtime and scripts
@@ -107,7 +107,7 @@ jobs:
     name: Unit & load tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install test deps
         # lua5.1 是 lua-path-bridge.sh 的探测对象：它要问解释器"你的默认
         # 搜索路径是什么"，没有解释器就只能退化到 --apply 的兜底分支，
@@ -212,7 +212,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -492,7 +492,7 @@ jobs:
           test -f /etc/dnsmasq.d/00-openclash-rt-uci.conf \
             && { echo "卸载后残留 dnsmasq 劫持配置（会导致整机断网）"; exit 1; } \
             || echo "dnsmasq 配置已清理 ✓"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: openclash-rt-deb
           path: dist/*.deb
