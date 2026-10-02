@@ -17,6 +17,19 @@ cleanup_dnsmasq() {
 
 SBIN_UCI_MARK=/usr/lib/openclash-rt/.sbin-uci-created
 
+# 清理 OpenClash 运行时写入的 nft 规则。
+# 上游 OpenClash 启动时会往 fw4 垫片的 table inet fw4 里写大量 chain/set
+# （openclash、openclash_mangle、nat_output、china_ip_route_pass 等）。这些
+# 是**运行时产物**，dpkg 不追踪；卸载后若残留，重新安装时 postinst 的
+# fw4 check 会报「检测到 nat_output 已被创建」失败（P5 实测踩过）。
+# 故 remove/purge 时整表删除 table inet fw4（它本就是 openclash-rt 的 fw4
+# 垫片建的骨架，删了不影响系统原生 nftables）。
+cleanup_nft() {
+	if command -v nft >/dev/null 2>&1; then
+		nft delete table inet fw4 2>/dev/null || true
+	fi
+}
+
 # ⚠️ 这里**刻意不做** `rm -f /sbin/uci`（旧实现是这么写的，是个真缺陷）。
 #    原因：/sbin/uci 常常**不是**本包创建的 —— postinst 只在"它不存在"时才补
 #    软链，存在（可能是别的包放的真实 uci）就跳过。于是旧实现的行为是
@@ -46,6 +59,7 @@ case "${1:-}" in
 		rm -f "$SBIN_UCI_MARK" 2>/dev/null || true
 		rmdir /usr/lib/openclash-rt 2>/dev/null || true
 		cleanup_dnsmasq
+		cleanup_nft
 		ldconfig 2>/dev/null || true
 		echo "openclash-rt: /etc/openclash 下的订阅与节点配置已保留，如需彻底清理请手动删除。"
 		;;
@@ -54,6 +68,7 @@ case "${1:-}" in
 		rm -rf /run/openclash 2>/dev/null || true
 		rm -f /etc/ld.so.conf.d/openclash-rt.conf 2>/dev/null || true
 		cleanup_dnsmasq
+		cleanup_nft
 		ldconfig 2>/dev/null || true
 		if command -v systemctl >/dev/null 2>&1; then
 			systemctl daemon-reload >/dev/null 2>&1 || true
