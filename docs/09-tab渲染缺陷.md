@@ -273,3 +273,125 @@ end
 
 > 教训（第二次犯）：真机反复试改 + 多轮探针效率极低。应在动手前
 > 先用「一次只改一个变量」的受控实验定位，且每轮都保留可回滚的基线。
+
+---
+
+## §12 Add 按钮根因（2026-10-02 定案，commit `49adbf4`）
+
+前面 §10/§11 的诊断方向全部错了：问题既不在 `cfgsections`，也不在
+`Map.prepare` / `create` 绑定，更不在浏览器传参。**真正的原因在自研的
+进程内 ubus uci 对象里。**
+
+### 12.1 决定性对照实验
+
+同一个按钮、同一个 POST、同样返回 `200` + `X-CBI-State: 0`
+（`FORM_PROCEED`，说明 create 已成功），但点完之后：
+
+| 机器 | 新段是否出现在页面 |
+|------|------------------|
+| ImmortalWrt 172.20.0.2 | `cfg2a8d41` **可见** |
+| openclash-rt .101（修复前） | **无** |
+| openclash-rt .101（修复后） | `cfg298d41` **可见** |
+
+判据：`HTML` 里 `cbid.openclash.<段名>.` 出现的新段名
+（必须排除主 section `openclash` 本身，它的选项名是
+`auto_restart` 之类，会造成假阳性 —— 第一次写判据时踩过）。
+
+### 12.2 根因
+
+`runtime/sys/luci-uci.lua` 的 `op_get` 在返回 section 时执行：
+
+```lua
+if not k:match("^%.") then clean[k] = v end   -- 剥掉所有元字段
+```
+
+于是 libuci 的 `.name` / `.type` / `.anonymous` / `.index` 全部消失。
+而遍历链**恰恰靠这些字段工作**：
+
+```
+luci.model.uci.foreach   (model/uci.lua:245)
+    section[".index"]  -> 排序
+    callback(section)  -> 回调拿到 section 表
+TypedSection.cfgsections (cbi.lua:1268)
+    if self:checkscope(section[".name"]) then
+        table.insert(sections, section[".name"])
+```
+
+元字段被剥 → `section[".name"]` 恒为 nil → `checkscope(nil)` 不通过
+→ 段被静默过滤 → `cfgsections()` 返回空表 → 页面不渲染新段。
+
+**段其实建出来了**（uci delta 里有），只是渲染阶段遍历不到。
+这就是这个 bug 难定位的原因：服务端日志、HTTP 状态、CSRF 全部正常。
+
+### 12.3 修法
+
+1. `op_get` 原样返回 section（含元字段），对齐 rpcd `uci.c`
+   的 `rpc_uci_getcommon` 语义。
+2. `op_get` 补`type` 过滤参数（`foreach` 会传 `{config=..., type=stype}`，
+   原实现忽略）。
+
+### 12.4 为什么不是「段没落盘」
+
+一开始怀疑过「Add 后段没写进 `/etc/config`」。实测**两台机器都是 0 段**
+—— 这是上游 LuCI 的正常设计：Add 只创建 uci delta，还需再点页面上的
+「保存 & 应用」才 commit。`Map.parse` 的 commit 条件是
+`(not self.proceed and self.flow.autoapply) or formvalue("cbi.apply")`，
+Add 之后 `proceed = true` 且没提交 `cbi.apply`，所以不 commit ——
+**与上游一致，不是缺陷**。
+
+### 12.5 顺带修正 `Map.prepare`（cbi.lua）
+
+前一版实现里create 调了 `luci.http.redirect()`。这会在
+`Node.parse` 执行期间抛redirect，导致 `Map.parse` 后续的
+`uci:save` / `uci:commit` **全部不执行** —— 实测返回
+`302 Location=...#lan_ac_traffic` 但段数 `0 -> 0`。
+
+> **通则**：任何在 `create` 内部调`luci.http.redirect` 的写法都会
+> 打断 commit。段要落盘就不能在 create 里跳转。
+
+现改为纯绑定 `AbstractSection.create`，不做任何跳转，
+与上游（匿名段 Add 后原地重渲染）行为一致。
+
+### 12.6 本轮踩到的三个坑
+
+1. **`class()` 不是拷贝父类方法。** `luci-lib-base/luasrc/util.lua:80`
+   是 `setmetatable({}, {__call=_instantiate, __index=base})`，
+   实例元表是 `{__index=class}` —— 纯委托。§11 里「class() 会拷贝方法、
+   定义在前面会被覆盖」的判断是错的。（位置约束仍然成立，但理由不同：
+   `Map.prepare` 必须定义在 `Map = class(Node)` 之后才能不被
+   `Node.prepare` 遮蔽。）
+
+2. **宿主是常驻进程，改文件必须重启才生效。**
+   9080 端口是 `/usr/lib/openclash-rt/luci-host.lua`（systemd
+   `openclash-rt-luci-host.service`），它在启动时就 `require` 了
+   `luci.cbi` 等模块。改完直接测，测的是内存里的旧代码 ——
+   白测好几轮。**每次改 vendor/runtime 后必须
+   `systemctl restart openclash-rt-luci-host.service`。**
+
+3. **`luci.syslog` 在本机不可用作探针通道。** journald 没在写盘
+   （`journalctl` 报 `No journal files were found`），探针输出全部丢失。
+   同理 `io.open('/tmp/x','a')` 也无效 —— unit 里有 `PrivateTmp=true`，
+   CGI 在私有 `/tmp` 里，外部看不到。**要验证 CGI 内部行为，
+   唯一可靠的通道是 HTTP 响应本身**（状态码 / `Location` /
+   `X-CBI-State` / 正文内容）。
+
+   > 反例记录：曾在 `dispatcher.lua` 里插 `io.open("/tmp/probe.log","a")`
+   > 探针，且 Lua 源码里的 `"\n"` 被写成了**真实换行**，把字符串切断，
+   > 导致 `dispatcher.lua:1378 unfinished string near '"'` ——
+   > 整个 LuCI 挂掉（页面全部 200 但 Content-Length: 0）。
+   > 这个损坏潜伏了多轮才被发现。**插探针后必须 `luac -p` 验语法。**
+
+### 12.7 排查方法论修正
+
+本轮定位靠的是「**双机同按钮对照 + 精确判据**」，而不是在真机上反复试改：
+
+- 先在ImmortalWrt 上确认「正确行为是什么」（新段立即可见）；
+- 再用最小 POST（只有 token + submit + 一个 `cts` 字段）直连服务端，
+  把「浏览器/宿主传参」与「cbi.lua 服务端逻辑」彻底分开；
+- 判据必须精确 —— 第一次用 `cbid.openclash.*` 通配导致主 section 的
+  选项名被误认为新段，差点得出「两台一致、无bug」的错误结论。
+
+工具：`scripts/_deploy/deploy-file.py`（部署 + 远端语法检查，
+注意 Git Bash 会把命令行里 `/` 开头的路径改写成 Windows 路径，
+需用无前导斜杠写法或 base64 传脚本）、`ui-probe-add-post.py`、
+`ui-probe-compare-add-visual.py`、`probe-add-server.py`。
