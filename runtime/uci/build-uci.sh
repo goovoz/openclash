@@ -91,11 +91,19 @@ BUILD_LUA=OFF
 
 log "编译 uci (BUILD_LUA=$BUILD_LUA)"
 rm -rf uci/build && mkdir -p uci/build && cd uci/build
+# -DLUAPATH：uci 的 lua/CMakeLists.txt 在没有它时会退到默认
+#   /usr/local/lib/lua/5.1（CMAKE_INSTALL_PREFIX 默认 /usr/local + lib/lua/5.1），
+#   **无视**上面的 -DCMAKE_INSTALL_PREFIX。CI 的 runner 是普通用户，写 /usr/local
+#   直接失败（file cannot create directory: /usr/local/lib/lua/5.1），而这在
+#   Debian 真机（root）上被掩盖 —— 与 build-ubus.sh 的 ubus.so 是同一类坑
+#   （那边 lua/CMakeLists.txt:3 SET(CMAKE_INSTALL_PREFIX /) 也是写死绝对路径）。
+#   显式传相对路径，让 Lua 绑定落在 $PREFIX/lib/lua/5.1（可被 DESTDIR/前缀收敛）。
 cmake .. \
 	-DCMAKE_INSTALL_PREFIX="$PREFIX" \
 	-DCMAKE_BUILD_TYPE=Release \
 	-DBUILD_LUA="$BUILD_LUA" \
 	${LUA_INC:+-DLUA_INCLUDE_DIR="$LUA_INC"} \
+	${LUA_INC:+-DLUAPATH=lib/lua/5.1} \
 	-DBUILD_STATIC=OFF
 make -j"$JOBS"
 make install
@@ -108,6 +116,20 @@ find "$PREFIX" -type f \( -name 'uci' -o -name '*.so*' \) | sed 's/^/  /'
 if [ ! -x "$PREFIX/sbin/uci" ] && [ ! -x "$PREFIX/bin/uci" ]; then
 	log "警告：未找到 uci 可执行文件，请检查上面的构建输出"
 	exit 1
+fi
+
+# Lua 绑定必须落在 $PREFIX 下（而不是悄悄写进 /usr/local/lib/lua/5.1）。
+# 这正是不传 -DLUAPATH 时会踩的坑：ci 的普通用户写不进 /usr/local 直接失败，
+# root 环境下却能"成功"却把产物装到了错误的位置 —— 两种都是缺陷。
+if [ "$BUILD_LUA" = "ON" ]; then
+	if [ -f "$PREFIX/lib/lua/5.1/uci.so" ]; then
+		log "uci.so 已落到 $PREFIX/lib/lua/5.1/（Lua 绑定就位）"
+	else
+		log "错误：BUILD_LUA=ON 但 $PREFIX/lib/lua/5.1/uci.so 缺失"
+		log "      —— 可能被 uci 的 lua/CMakeLists.txt 写到了系统路径（缺 -DLUAPATH）"
+		find "$PREFIX" -name 'uci.so' 2>/dev/null | sed 's/^/      实际位置: /'
+		exit 1
+	fi
 fi
 
 # 冒烟测试：uci CLI 必须能独立运行（不依赖 OpenWrt）
