@@ -24,6 +24,37 @@
 				<% end %>
 			</div>
 		<%- end %>
+		<%-
+			-- [openclash-rt 2026-10-02修正] 补渲染「不带 tab 的 section」
+			--
+			-- 现象：Plugin Settings / Overwrite Settings 两页上，
+			--   Lan Traffic Access List（settings.lua:278s2）、
+			--   Set Authentication（config-overwrite.lua:582 s）、
+			--   Config Subscribe 等**无 tab** 的 section 整段消失 ——
+			--   连Add 按钮（name="cbi.cts.openclash.<type>."）都不渲染，
+			--   页面上 grep 不到该section 名。
+			--
+			-- 根因：本模板是 if/else 二选一 ——
+			--     if self:has_tabs() then self:render_tabcontainer("m")
+			--     else self:render_children() end
+			-- 而 render_tabcontainer 只遍历「有 tabs 的 child」
+			--（cbi.lua 里 `if section:has_tabs()`）。一旦页面上存在任意
+			-- 一个 tab section，has_tabs() 就为真，于是走tab 分支，
+			-- **所有无 tab 的 child 一个都不渲染**。
+			--
+			-- 为什么之前没暴露：早先用的是 `else`分支的 render_children，
+			-- 无 tab 的 section 正常渲染；后来为了修「tab 全空」引入了
+			-- has_tabs/render_tabcontainer，把 else 变成了 if-then 的
+			-- 互补分支，副作用就是丢掉了无 tab 的 section。
+			--
+			-- 修法：tab 分支之后补一段，只渲染无 tab 的 child。
+			-- **不能用 self:render_children()** —— 它会遍历全部 children，
+			-- 把带 tab 的 section 再渲染一遍（N×N 重复，见 cbi.lua 里
+			-- render_tabcontainer 注释的坑 1）。
+			-- 因此需要一个「只渲染无 tab child」的入口，给它单独一个方法。
+		-%>
+		<% self:render_children_notabbed() %>
+
 	<% else %>
 		<%- self:render_children() %>
 	<% end %>

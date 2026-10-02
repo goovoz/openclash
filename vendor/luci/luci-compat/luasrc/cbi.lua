@@ -267,7 +267,6 @@ function Node.render_children(self, ...)
 	end
 end
 
-
 --[[
 A simple template element
 ]]--
@@ -478,6 +477,121 @@ function Map.has_tabs(self)
 		end
 	end
 	return false
+end
+
+-- [openclash-rt 适配] 只渲染「不带 tab 的 child」，供 view/cbi/map.htm 用
+--
+-- 背景（2026-10-02 真机实测，Debian 12 @ 172.20.0.101:9080）：
+--   map.htm 是 if/else 二选一：
+--       if self:has_tabs() then self:render_tabcontainer("m")
+--       else self:render_children() end
+--   而 render_tabcontainer 只遍历**有 tabs 的** child
+--   （`if section:has_tabs()`）。于是页面上只要存在任意一个 tab section，
+--   has_tabs() 就为真 -> 走 tab 分支 -> **所有无 tab 的 child 一个都不渲染**。
+--
+--   症状：Plugin Settings / Overwrite Settings 上，Lan Traffic Access List、
+--   Set Authentication、Config Subscribe 这些 section 整段消失，连 Add
+--   按钮（name="cbi.cts.openclash.<sectiontype>."）都不渲染 ——
+--   页面上 grep 不到 section 名，Add 按钮「找不到」。
+--
+-- 为什么不能直接用 render_children：它遍历**全部** children，会把带 tab 的
+-- section 在 tabcontainer 里已经渲染过一遍的内容再来一遍 -> N×N 重复
+-- （这正是 render_tabcontainer 注释里「坑 1」描述的问题）。
+--
+-- 所以单独提供这个入口，只渲染无 tab 的 child。
+--
+-- last_child / index 的处理与 Node.render_children 保持一致：模板里
+-- 靠 node.last_child 决定是否输出分隔符、靠 node.index 显示序号。
+-- 这里用「已见数量」而非 #self.children，因为渲染的是子集。
+function Map.render_children_notabbed(self, ...)
+	local k, node, seen = 0, nil, 0
+	local total = 0
+	for _k, _n in ipairs(self.children) do
+		if not (_n and _n.has_tabs and _n:has_tabs()) then
+			total = total + 1
+		end
+	end
+	for k, node in ipairs(self.children) do
+		if not (node and node.has_tabs and node:has_tabs()) then
+			seen = seen + 1
+			node.last_child = (seen == total)
+			node.index = seen
+			node:render(...)
+		end
+	end
+end
+-- 位置说明：必须在 Map = class(Node) 之后（本文件 ~336 行）。
+-- util.class() 是 setmetatable + __index 委托，定义在 class() 之前的
+-- Map.* 会被 Node.* 遮蔽（同 Map.has_tabs / Map.render_tabcontainer）。
+
+
+-- [openclash-rt 2026-10-02 修正] render_tabcontainer 曾被误当作
+-- 2032cf4 遗留的死代码删除，但 view/cbi/map.htm:13 真的在调它
+-- （`self:render_tabcontainer("m")`）—— 导致 Plugin Settings 与
+-- Overwrite Settings 整页 500：
+--     map.htm:1: attempt to call method 'render_tabcontainer' (a nil value)
+-- 判断依据是「cbi.lua 里已无调用者」，但调用者在模板里。
+-- **教训：vendor 层删除任何函数前，必须全仓搜 .htm 等模板。**
+-- 本函数必须定义在 Map = class(Node) 之后（同 Map.prepare）。
+
+
+-- [openclash-rt 适配] 渲染 Map 下各 section 的 tab
+-- 供 view/cbi/map.htm 调用（21.02 的 map.htm 没有这段，是新版才有的）。
+--
+-- ⚠️ 三个坑（2026-10-02 真机实测逐个踩过）：
+--
+-- 1) **不能**在这里再逐 tab 循环。tabcontainer.htm 自己就
+--    `for _, tab in ipairs(self.tab_names)` 循环渲染全部 tab
+--    （该模板第 1 行）。外面套一层 → N×N 重复。
+--
+-- 2) 传给模板的 `self` 必须是**section**（有 tab_names/tabs 的那个），
+--    不是 Map。传 Map 会静默渲染 0 个容器（Map 没有 tab_names）。
+--
+-- 3) **不能**用 `luci.template.render("cbi/tabcontainer", ...)` ——
+--    它在 21.02 里会把内容**累积**到全局输出缓冲，多次调用产生
+--    重复内容（实测 15 个 tab 的标题被输出约 30 遍，5MB 里大半是重复）。
+--    改为**直接内联渲染**：自己拼 tab 容器 div + 调section:render_tab()。
+--    这与 tabcontainer.htm 的逻辑等价，但不经过嵌套模板。
+-- 【2026-10-02 修正】原实现用 `luci.write(...)` 直接写响应，但 luci.write
+-- 是 luci.http 挂上去的（http.lua:199），cbi.lua 顶部**没有** require 它。
+-- 该函数在 map.htm 的模板上下文里被调用，此时 luci.write 尚未绑定
+-- -> `attempt to call field 'write' (a nil value)`，两页直接 500。
+--
+-- 改为在函数内按需 require 并取本地 write。本文件里 luci 已被
+-- dispatcher 以 setfenv 注入，用 require 拿最稳，不依赖调用顺序。
+function Map.render_tabcontainer(self, prefix)
+	local http = require "luci.http"
+	local write = http.write
+	local pcdata = require "luci.util".pcdata
+
+	local written = false
+	for _, section in ipairs(self.children) do
+		if section and section.has_tabs and section:has_tabs() then
+			for _, tab in ipairs(section.tab_names or {}) do
+				local data = (section.tabs or {})[tab] or {}
+				local css = "cbi-tabcontainer"
+				if not written then
+					-- 只有第一个 tab 带 cbi-tabcontainer 的主class，
+					-- 与新版 LuCI 行为一致：tab 切换脚本按容器定位
+					css = "cbi-tabcontainer cbi-tabcontainer-first"
+					written = true
+				end
+				write(string.format(
+					'<div class="%s" id="container.%s.%s.%s" data-tab="%s" data-tab-title="%s" data-tab-active="%s">',
+					css, tostring(self.config), tostring(prefix or "m"),
+					tostring(tab), tostring(tab),
+					pcdata(tostring(data.title or tab)),
+					tostring(tab == (section.selected_tab or section.tab_names[1]))
+				))
+				if data.description and #data.description > 0 then
+					write('<div class="cbi-tab-descr">'
+						.. pcdata(tostring(data.description)) .. '</div>')
+				end
+				section:render_tab(tab, prefix or "m")
+				write('</div>')
+			end
+		end
+	end
 end
 
 -- [openclash-rt 适配] Add 按钮修复：给匿名 TypedSection 补默认 create

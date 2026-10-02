@@ -73,7 +73,7 @@ def main():
             tmp = "/tmp/.deploy-" + os.path.basename(args.remote)
             check = {
                 "lua": f"luac -p {tmp} 2>&1; echo SYNTAX_RC=$?",
-                "sh": f"sh -n {tmp} 2>&1; echo SYNTAX_RC=$?",
+                "sh": f"bash -n {tmp} 2>&1; echo SYNTAX_RC=$?",
             }.get(args.syntax, "echo SYNTAX_RC=skipped")
             script = (f"{check} || exit 1\n"
                       f"cp {tmp} {args.remote} && rm -f {tmp}\n"
