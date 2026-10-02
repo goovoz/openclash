@@ -396,3 +396,116 @@ Add 之后 `proceed = true` 且没提交 `cbi.apply`，所以不 commit ——
 注意 Git Bash 会把命令行里 `/` 开头的路径改写成 Windows 路径，
 需用无前导斜杠写法或 base64 传脚本）、`ui-probe-add-post.py`、
 `ui-probe-compare-add-visual.py`、`probe-add-server.py`。
+
+---
+
+## §13 Add 修复部署后引出的二次回归（commit `3c6c9fc`）
+
+把 `49adbf4`（op_get 保留元字段）打进 deb 装到真机后，**五页回归从 5/5
+掉到 3/5** —— Plugin Settings / Overwrite Settings 双双 500：
+
+```
+map.htm:1: attempt to call method 'render_tabcontainer' (a nil value)
+```
+
+### 13.1 根因 1：`render_tabcontainer` 不是死代码
+
+`1f4a07f`（修tab 渲染）把它当 `2032cf4` 遗留死代码删掉了。判断依据是
+「cbi.lua 里已无调用者」—— **错在只搜了 .lua，没搜模板**：
+
+```
+vendor/luci/luci-compat/luasrc/view/cbi/map.htm:13
+    <% self:render_tabcontainer("m") %>
+```
+
+> **通则：vendor 层删除任何函数前，必须全仓搜 `.htm`（以及 `.cgi`、
+> `.sh`、`.js`）—— LuCI 大量用模板驱动，调用者常在模板里。**
+
+恢复后又暴露第二个问题：该函数内部用 `luci.write`，而 `luci.write`
+是 `luci.http` 挂上去的（`http.lua:199`），cbi.lua 顶部没有 require
+它-> nil。改为函数内 `local http = require "luci.http"` 取本地 write。
+
+### 13.2 根因 2：`map.htm` 的 if/else 把无 tab 的 section 全部丢掉
+
+`map.htm` 是二选一：
+
+```lua
+<% if self:has_tabs() then %>
+    <% self:render_tabcontainer("m") %>
+<% else %>
+    <%- self:render_children() %>
+<% end %>
+```
+
+而 `render_tabcontainer` 只遍历**有 tabs 的** child
+（`if section:has_tabs()`）。于是：
+
+> 页面上只要存在**任意一个** tab section，`has_tabs()` 就为真
+> -> 走 tab 分支 -> **所有无 tab 的 child 一个都不渲染**。
+
+症状极其隐蔽：页面 200、tab 数正确（15/15 / 5/5），但页面里
+`lan_ac_traffic` 出现 **0 次**，`cbi.cts.*` / `cbi.rts.*` 字段一个
+都没有 —— 连 Add 按钮都不存在。受影响的 section：
+
+| 文件:行 | section |
+|---------|---------|
+| `settings.lua:278` | Lan Traffic Access List |
+| `config-overwrite.lua:582` | Set Authentication |
+| `config-subscribe.lua` | Config Subscribe |
+
+之前一直没暴露，是因为用的还是 `else` 分支的 `render_children`。
+后来为修「tab 全空」引入 `has_tabs` / `render_tabcontainer`，把 `else`
+变成了 `if` 的互补分支 —— 副作用就是丢掉了无 tab 的 section。
+
+修法：新增 `Map.render_children_notabbed`，只渲染无 tab 的 child。
+
+**不能用 `render_children`**：它遍历全部 children，会把带 tab 的
+section 在 tabcontainer 里已渲染过的内容再来一遍 -> N×N 重复。
+`last_child` / `index` 用「已见数量」而非 `#self.children`，因为
+渲染的是子集。
+
+### 13.3 验证结果
+
+五页 5/5；Plugin Settings **354307B / 15 tab / 145 控件**
+（历史最高；`49adbf4` 之前是 81426B）。
+
+Add 四用例全部生效，新段名与 ImmortalWrt 一致：
+
+```
+Lan Traffic Access List   段 1 -> 2新段 cfg2a8d41
+Set Authentication        段 39 -> 3    新段 cfg2ab425
+Add Custom DNS Servers    302 -> custom-dns-edit/cfg2a6193
+Config Subscribe Edit     302 -> config-subscribe-edit/cfg2ab6bc
+```
+
+### 13.4 一个把我带偏两次的探针陷阱
+
+**不能用最小 POST**（只发 `token + cbi.submit + cbi.cts.*`）来验证Add：
+
+```
+X-CBI-State: -1        （FORM_INVALID）
+```
+
+页面上所有 option 的 formvalue 都是 nil，其中 required / 带 validate
+的 option 校验失败 -> `AbstractValue.parse` 的 tag_error 分支把
+`map.save` 打成 false -> `Map.parse` 开头就`return self:state_handler(...)`
+-> `Node.parse` 根本不执行 -> create 永远不会被调用。
+
+真实浏览器点 Add 会提交表单里**全部成功控件**，所以不会触发。
+
+> 我用最小 POST 连着两次得出「Add 又坏了」的结论，都是探针的问题。
+> 正确做法：`curl-add-full.sh` + `form-fields.py` 回填全部控件。
+>
+> 附带：`X-CBI-State` 的取值语义（cbi.lua 19-25 行）
+> `4=SKIP 2=CHANGED 1=VALID 0=PROCEED/NODATA -1=INVALID`，
+> **0 也是成功**（create 成功 -> proceed），别误判成失败。
+
+### 13.5 本轮环境侧的两个坑
+
+1. **`dpkg -i` 被 conffile 提示卡死**：`/etc/config/system` 已在
+   `conffiles` 里，必须 `dpkg --force-confold -i`（`-o` 是 apt 的选项，
+   dpkg 不认）。
+
+2. **Git Bash 会把命令行里以 `/` 开头的路径改写成 Windows 路径**，
+   包括传给 Python 的 argv。`deploy-file.py put` 的 remote 参数因此
+   要求写成不带前导斜杠的 `usr/lib/lua/luci/cbi.lua`。
