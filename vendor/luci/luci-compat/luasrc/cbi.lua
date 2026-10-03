@@ -567,6 +567,40 @@ function Map.render_tabcontainer(self, prefix)
 	local written = false
 	for _, section in ipairs(self.children) do
 		if section and section.has_tabs and section:has_tabs() then
+			-- ★ 关键（2026-10-03 真机实测追出）：必须取 section 的**真实段名**。
+			--
+			-- 原实现写的是 `section:render_tab(tab, prefix or "m")`，
+			-- 把容器 id 用的 prefix（map.htm 传的 "m"）当成了段名往下传。
+			-- render_tab -> node:render(..., scope) 最终决定
+			-- AbstractValue.cbid(section) 的前缀，于是页面上所有字段的
+			-- name 都变成 `cbid.openclash.m.<option>`。
+			--
+			-- 而 model 里这些 option 挂的是主 section，真实段名是
+			-- uci 里的段名（OpenWrt 上是 "config"）。name 前缀错了，
+			-- 服务端 AbstractValue.parse 用
+			--     formvaluetable("cbid.openclash." .. section)
+			-- 取值时永远取不到 -> fvalue 为 nil -> required 项校验失败
+			-- -> AbstractValue.add_error 把 map.save 打false
+			-- -> Map.parse 返回 FORM_INVALID(-1)
+			-- -> 整页保存失败（实测 interface_name 选 eth0 也存不进去，
+			--    /etc/config/openclash 里连这一行都没有）。
+			--
+			-- 对照证据：同一份 model、同一份 uci（段名都是 config），
+			--   ImmortalWrt 172.20.0.2-> name 前缀 cbid.openclash.config.*
+			--                              -> X-CBI-State: 1（成功）
+			--   openclash-rt  .101-> name 前缀 cbid.openclash.m.*
+			--                              -> X-CBI-State: -1（失败）
+			--
+			-- 段名取法：优先 cfgsections() 的第一个（真实段名），
+			-- 该类型一个段都没有时退回 sectiontype（匿名段的占位名）。
+			local sid
+			local ok, secs = pcall(function() return section:cfgsections() end)
+			if ok and type(secs) == "table" and #secs > 0 then
+				sid = secs[1]
+			else
+				sid = section.sectiontype or "cfg"
+			end
+
 			for _, tab in ipairs(section.tab_names or {}) do
 				local data = (section.tabs or {})[tab] or {}
 				local css = "cbi-tabcontainer"
@@ -587,7 +621,8 @@ function Map.render_tabcontainer(self, prefix)
 					write('<div class="cbi-tab-descr">'
 						.. pcdata(tostring(data.description)) .. '</div>')
 				end
-				section:render_tab(tab, prefix or "m")
+				-- 传真实段名 sid，不是 prefix
+				section:render_tab(tab, sid)
 				write('</div>')
 			end
 		end
