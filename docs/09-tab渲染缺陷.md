@@ -641,3 +641,118 @@ Playwright 的 `networkidle` 要等所有 XHR（含 myip_check）才报，
 3. **改完 vendor 必须重启宿主**（`systemctl restart
    openclash-rt-luci-host.service`）。有一次诊断补丁的 `error()`
    没重启，页面直接 500，误以为「诊断没输出」，白绕了几轮。
+
+---
+
+## §15 Overviews 页性能（2026-10-03）
+
+### 15.1 定位
+
+服务端本机各页耗时（3 次平均）：
+
+```
+client             0.167s    525KB
+config             0.186s    1.14MB
+settings           0.105s
+config-overwrite   0.106s
+log                0.036s
+config-subscribe   0.040s
+```
+
+静态资源 < 3ms，ping 0ms。**服务端不慢。**
+
+抓 Overviews 的 25 个 XHR，只有两个占时间：
+
+```
+myip_check   10.799s  8483B     <- 主因
+startlog      3.042s  8206B
+其余 8 个端点  < 0.22s
+```
+
+### 15.2 myip_check：上游设计行为（commit `2f8ba66`）
+
+`openclash.lua:2329 action_myip_check` 用 `nixio.fork` + curl **并行**查
+多个「出口 IP 查询服务」（`MAX_CONCURRENT = 3`，每个 `curl -SsL -m 10`）。
+
+真机实测 6 个服务：
+
+| 服务 | 结果 |
+|------|------|
+| `whois.pconline.com.cn` | **rc=28 超时，等满 10 秒** |
+| `myip.ipip.net` | 94B 正常 |
+| `api.ip.sb/geoip` | 308B 正常 |
+| `api.ipify.org` | 22B 正常 |
+| `ifconfig.me` | 166B 正常 |
+| `ipapi.co` | 767B 正常 |
+
+上游已做并行，不是串行退化 —— 属正常 fallback 行为，
+**与内核是否运行无关**（启动前后都是 10.8s）。
+
+修法：在自研宿主 `runtime/sys/luci-host.lua` 的 CGI 入口加结果缓存
+（L1 上游零修改）：
+
+- 缓存文件 `/tmp/openclash-rt-myip.cache`，首行 `<mtime> <size>`
+- **全失败不缓存**（body 里没有一行含 `"ip"` 时丢弃），
+  避免把一次网络故障固化 5 分钟
+- 语义保持：原样存整份 body，命中时按同格式回放（含 `write_padded`
+  的 8192 空格 padding），前端 JS 完全无感
+- 配置项 `/etc/config/openclash-rt` 的 `main.myip_cache_ttl`（默认 300，0 = 关闭）
+
+效果：
+
+```
+第1次 10.801s（真查，落盘8499B）
+第2次  0.000863s
+第3次  0.000681s
+...
+```
+
+### 15.3 剩余的 8 秒：宿主单进程同步（fork 改造已回滚）
+
+`DOMContentLoaded` 本身要 8~10 秒（**不是**等 XHR），原因是宿主主循环
+`dispatch(sock, req)` 在 accept 循环里同步阻塞 —— 一个 CGI 跑 10 秒期间
+所有新连接（含静态资源）都排队。
+
+CGI 本身不慢：10 个并发 status 473ms vs 串行 537ms（每个 CGI 都 fork
+子进程，本来就并行）。瓶颈在宿主把连接串起来了。
+
+**改成 fork-per-connection 的实测效果**（已回滚，见下）：
+
+```
+DOMContentLoaded   8~10s  ->  0.29~0.36s
+9 个并发请求总耗时  9146ms  ->  3054ms（3 个 startlog 全部 3.04s，真并发）
+```
+
+### 15.4 fork 改造为什么回滚
+
+压测 30~60 并发**进程泄漏**：30 个请求留下 92 个进程卡在
+`inet_csk_accept`，内存涨到 7.3GB / 8GB，只增不减，最终必然 OOM。
+
+排查到什么程度：
+
+- **宿主 fd 泄漏已定位并修复** —— accept 后必须 `sock:close()`。
+  fork 后父子进程各持**独立 fd 表项**，父进程关自己那份不影响子进程
+  （我最初注释写「不能 close」是错的）。
+- **子进程仍链式增殖** —— 进程树显示孙进程的 ppid 是子进程而非宿主。
+- **隔离复现证明机制本身没问题**：`fork + exit` /
+  `fork + close(listen) + exit` / `fork + popen + exit` /
+  `fork + close(listen) + popen + exit` 四种组合各10 次，
+  **fd 零增长、进程零残留**。`os.exit(0)` 有效性也单独验证过（子进程 GONE）。
+- 因此泄漏原因**尚未查明**，不能带风险上线，已 `git checkout` 回滚到
+  同步实现（commit `2f8ba66` 的版本）。
+
+### 15.5 教训
+
+> **做性能优化必须压测。**
+> fork 版单看功能回归与页面速度都很好（5/5 通过、DOMContentLoaded 0.3s），
+> 是压测才暴露进程泄漏。只跑功能验证会直接放过去。
+
+对比数据留在真机上可复现：
+
+```bash
+# 同步版（当前）
+for i in $(seq 1 15); do
+  curl -s "$U/status" & curl -s "$U/../cbi.js" &
+done; wait
+# -> 进程数恒为 1
+```
