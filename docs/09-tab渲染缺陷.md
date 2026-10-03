@@ -509,3 +509,135 @@ X-CBI-State: -1        （FORM_INVALID）
 2. **Git Bash 会把命令行里以 `/` 开头的路径改写成 Windows 路径**，
    包括传给 Python 的 argv。`deploy-file.py put` 的 remote 参数因此
    要求写成不带前导斜杠的 `usr/lib/lua/luci/cbi.lua`。
+
+---
+
+## §14 整页配置存不进去 + 内核启动失败（2026-10-03，commit `416ef35`）
+
+用户反馈三件事：内核启动失败、Overwrite Settings 的 Bind Network Interface
+存不进 eth0、页面加载很慢。前两个**同一个根因**。
+
+### 14.1 根因：`render_tabcontainer` 把 prefix 当成了段名
+
+`Map.render_tabcontainer` 里写的是：
+
+```lua
+section:render_tab(tab, prefix or "m")     -- ← prefix是容器 id 用的
+```
+
+`prefix` 来自 `map.htm` 的 `self:render_tabcontainer("m")`，本意只是给
+容器 div 的 id 用的。但它被当作**段名**一路传下去：
+
+```
+render_tab(tab, sid) -> node:render(..., scope)
+                     -> AbstractValue.cbid(sid)
+                     -> "cbid." .. config .. "." .. sid .. "." .. option
+```
+
+于是页面上所有字段的 name 都变成 `cbid.openclash.m.<option>`，
+而这些 option 挂的是主 section，真实段名是 `config`。
+
+后果链条：
+
+```
+name 前缀错 -> 服务端 formvaluetable("cbid.openclash.config") 取不到
+            -> fvalue = nil
+            -> required / 带 validate 的 option 校验失败
+            -> AbstractValue.add_error 把 map.save = false
+            -> Map.parse 返回 FORM_INVALID(-1)
+            -> **整页保存失败**
+```
+
+### 14.2 决定性对照证据
+
+同一份 model、同一份 uci（主 section 段名都是 `config`）：
+
+| | 页面上 name 前缀 | X-CBI-State | interface_name 落盘 |
+|---|---|---|---|
+| ImmortalWrt 172.20.0.2 | `cbid.openclash.config.*` | **1** | 是 |
+| openclash-rt .101（修复前） | `cbid.openclash.m.*` | **-1** | **否** |
+| openclash-rt .101（修复后） | `cbid.openclash.config.*` | **2** | 是 |
+
+修复前 `/etc/config/openclash` 里**连 `option interface_name` 这一行都没有**
+（model 里它有 `o.default = "0"`，本该落盘）。
+
+### 14.3 为什么也导致内核启动失败
+
+`log_level` 同样没落盘 -> `uci get` 返回空 -> `yml_change.sh` 生成
+`log-level: ''` -> mihomo 拒绝空值：
+
+```
+level=fatal msg="Parse config error: invalid log-level"
+```
+
+日志里连续 5 次（09:10~09:12），每次间隔约 20~40 秒（守护重启）。
+**表面看是"内核起不来"，实际是 Overwrite Settings 整页没保存。**
+
+### 14.4 修法
+
+```lua
+local sid
+local ok, secs = pcall(function() return section:cfgsections() end)
+if ok and type(secs) == "table" and #secs > 0 then
+    sid = secs[1]                          -- 真实段名（具名段）
+else
+    sid = section.sectiontype or "cfg"     -- 匿名段占位名
+end
+section:render_tab(tab, sid)
+```
+
+匿名段（`dns_servers` 等）没有真实段名，退回 sectiontype 正确——
+它们在页面上显示的是 uci 生成的 `cfgXXXXXX`，实测一致。
+
+### 14.5 验证
+
+- 五页 5/5；各页 cbid 前缀与 OpenWrt 一致（`config` / `cfgXXXXXX`）
+- Add 四用例仍全部生效
+- Bind Network Interface 选 eth0 -> Commit Settings ->
+  `uci get openclash.config.interface_name` = `eth0`
+- 内核：`OpenClash Start Successful!`，`log-level: info`，
+  进程 `clash` 监听 7893 / 7874 / 9090
+
+### 14.6 「页面加载慢」不是缺陷
+
+各页**服务端本机**耗时（3 次平均）：
+
+```
+client             0.167s    525KB
+config             0.186s    1.14MB
+settings           0.105s
+config-overwrite   0.106s
+log                0.036s
+config-subscribe   0.040s
+```
+
+静态资源 < 3ms，ping 0ms。慢的是 Overviews（client）页面的
+**25 个 XHR**，其中 `myip_check` 稳定占 **10.8 秒**。
+
+`myip_check` 是上游的「多服务并行查出口 IP」实现
+（`openclash.lua` 的 `MAX_CONCURRENT = 3`，每个 `curl -m 10`）。
+本机实测 `whois.pconline.com.cn` 超时（rc=28，等满 10 秒），
+其余 5 个服务都正常。**这是上游设计行为，与内核是否运行无关**
+（内核启动前后都是 10.8s），不属本项目缺陷。
+
+页面实际可用时间 = `DOMContentLoaded` 0.34s；
+Playwright 的 `networkidle` 要等所有 XHR（含 myip_check）才报，
+所以自动化里看到 17~28s，**人眼感知的前端可用时间不到 1 秒**。
+
+### 14.7 本轮的方法论教训
+
+1. **UI 上「控件能显示、能选中」不等于「能提交」。** 判据必须看
+   POST body 的字段 name 与服务端 `X-CBI-State`，而不是看页面元素存在。
+2. **`-1`（FORM_INVALID）几乎总是 required 校验失败**，而失败原因
+   LuCI 不输出。三种探针通道全部失效：
+   - `luci.syslog`：journald 未落盘
+   - `io.open('/tmp')`：unit 有 `PrivateTmp=true`
+   - `luci.write` / `http.header` / `error()`：在 `Map.parse` 阶段
+     缓冲未启用 / 被宿主过滤
+
+   **唯一可靠的定位手段是「双机同条件对照」**：把同一份 model、同一份
+   uci 在ImmortalWrt 与本机各跑一遍，比对 POST body 的字段前缀。
+   本轮前期在探针上花了十几轮，真正定位靠的就是这一步。
+3. **改完 vendor 必须重启宿主**（`systemctl restart
+   openclash-rt-luci-host.service`）。有一次诊断补丁的 `error()`
+   没重启，页面直接 500，误以为「诊断没输出」，白绕了几轮。
