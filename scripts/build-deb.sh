@@ -716,6 +716,12 @@ config openclash_rt 'main'
 	option port '9080'
 	option script_timeout '3600'
 	option max_connections '100'
+	# myip_check 结果缓存秒数。0 = 关闭（每次都真查出口 IP）。
+	# 上游 action_myip_check 会并行查多个出口 IP 服务（每个 curl -m 10），
+	# 只要有一个服务不通就等满 10 秒 —— 真机实测 whois.pconline.com.cn
+	# 不通，Overviews 页恒等 10.8s。宿主侧缓存把它降到~1ms。
+	# 详见 runtime/sys/luci-host.lua 的 §C2。
+	option myip_cache_ttl '300'
 EOF
 fi
 
