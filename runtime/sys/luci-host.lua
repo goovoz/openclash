@@ -65,6 +65,12 @@ local DEFAULTS = {
 	max_content   = 1024 * 10240,   -- 10 MiB，与上游 uci-defaults 改 http.lua 的值一致
 	script_timeout = 3600,           -- 上游要求
 	max_connections = 100,
+	-- myip_check 结果缓存秒数。0 = 关闭缓存（每次都真查）。
+	-- 为什么需要：上游 action_myip_check 会fork curl 并行查多个出口 IP
+	-- 服务（每个 -m 10，MAX_CONCURRENT=3），只要有一个服务不通就等满 10s。
+	-- 真机实测 whois.pconline.com.cn 不通 -> Overviews 页恒等 10.8s。
+	-- 详见 §C2。
+	myip_cache_ttl  = 300,
 }
 
 local CGI_BIN_PREFIX = "/cgi-bin/luci"   -- 唯一 CGI 入口（vendor luci-base 的硬编码）
@@ -122,10 +128,17 @@ local function tonum_pos(s, fallback)
 	if n and n > 0 then return n end
 	return fallback
 end
+-- TTL 允许 0（= 关闭缓存），所以不能用 tonum_pos
+local function tonum_zero(s, fallback)
+	local n = tonumber(s)
+	if n and n >= 0 then return n end
+	return fallback
+end
 ARGS.port           = tonum_pos(ARGS.port, DEFAULTS.port)
 ARGS.max_content    = tonum_pos(ARGS.max_content, DEFAULTS.max_content)
 ARGS.script_timeout = tonum_pos(ARGS.script_timeout, DEFAULTS.script_timeout)
 ARGS.max_connections= tonum_pos(ARGS.max_connections, DEFAULTS.max_connections)
+ARGS.myip_cache_ttl = tonum_zero(ARGS.myip_cache_ttl, DEFAULTS.myip_cache_ttl)
 
 -- -----------------------------------------------------------------------------
 -- §C 从 /etc/config/openclash-rt 读 listen/port/script_timeout（如果存在）
@@ -161,6 +174,90 @@ if UCI_CFG.listen          and _parsed["listen"]          == nil then ARGS.liste
 if UCI_CFG.port            and _parsed["port"]            == nil then ARGS.port            = tonum_pos(UCI_CFG.port,            ARGS.port) end
 if UCI_CFG.script_timeout  and _parsed["script_timeout"]  == nil then ARGS.script_timeout  = tonum_pos(UCI_CFG.script_timeout,  ARGS.script_timeout) end
 if UCI_CFG.max_connections and _parsed["max_connections"] == nil then ARGS.max_connections = tonum_pos(UCI_CFG.max_connections, ARGS.max_connections) end
+if UCI_CFG.myip_cache_ttl  and _parsed["myip_cache_ttl"]  == nil then ARGS.myip_cache_ttl  = tonum_zero(UCI_CFG.myip_cache_ttl, ARGS.myip_cache_ttl) end
+
+-- -----------------------------------------------------------------------------
+-- §C2 myip_check 结果缓存
+-- -----------------------------------------------------------------------------
+-- 背景（2026-10-03 真机实测，Debian 12 @ 172.20.0.101:9080）：
+--   Overviews（client）页会发25 个 XHR，其中 `myip_check` 稳定耗时 **10.8s**，
+--   导致整页 networkidle 要17~28s。根因是上游 `action_myip_check`
+--   （openclash.lua:2329）用 fork+curl 并行查多个「出口 IP 查询服务」，
+--   每个 `curl -m 10`，MAX_CONCURRENT=3；本机实测
+--   `whois.pconline.com.cn` 不通（rc=28，等满 10 秒），其余 5 个都正常。
+--   与内核是否运行无关（启动前后都是 10.8s）—— 属上游设计行为。
+--
+-- 为什么在宿主做缓存（而不是改上游 controller）：
+--   L1 上游零修改是红线，`openclash.lua` 一个字都不能动。
+--   宿主 luci-host.lua 是 P3 自研件，本就可以按需扩展。
+--
+-- 语义保持：
+--   上游输出是**每行一个 JSON**（{service, ip, geo, raw}），
+--   首次write_padded 还会先写8192 个空格做 padding
+--   （见 openclash.lua:1578的 write_padded）。缓存原样存整份 body，
+--   命中时按同样格式回吐 —— 前端 JS 完全无感。
+--
+-- 失效策略：TTL 到点、或上游返回体里一个可用结果都没有（全是失败）时
+--   不写缓存 —— 避免把一次网络故障固化 5 分钟。
+--
+-- 并发：宿主是**单进程同步**处理连接（见 §K），所以不需要额外的锁；
+--   但 CGI 子进程是异步的，见下面的 refresh_async。
+-- -----------------------------------------------------------------------------
+local CACHE_FILE = "/tmp/openclash-rt-myip.cache"
+
+-- 从 CGI body 里挑出真正可用的结果行（ip 非空）。
+-- 上游失败时也会吐 `{"service":"xxx"}` 这种没有 ip 的行，必须滤掉，
+-- 否则会把一次全失败的结果缓存住。
+local function myip_extract_usable(body)
+	local usable = {}
+	for line in tostring(body or ""):gmatch("[^\r\n]+") do
+		line = line:gsub("^%s+", "")
+		if line:find('"ip"') then
+			local ip = line:match('"ip"%s*:%s*"([^"]*)"')
+			if ip and ip ~= "" then usable[#usable + 1] = line end
+		end
+	end
+	return usable
+end
+
+local function myip_cache_read()
+	local ttl = tonumber(ARGS.myip_cache_ttl) or 0
+	if ttl <= 0 then return nil end
+	local st = nixio_fs.stat(CACHE_FILE)
+	if not st or st.type ~= "reg" then return nil end
+	-- mtime + size 都要留：mtime 判TTL，size 用来识别半截写入
+	local f = io.open(CACHE_FILE, "r")
+	if not f then return nil end
+	local head = f:read("*l")            -- 第一行是 "<mtime> <size>"
+	local body = f:read("*a")
+	f:close()
+	if not head then return nil end
+	local mt, sz = head:match("^(%d+)%s+(%d+)$")
+	if not mt or not sz then return nil end
+	if os.difftime(os.time(), tonumber(mt)) > ttl then return nil end
+	if #body ~= tonumber(sz) then return nil end   -- 写了一半
+	-- 校验确实有可用行
+	if #myip_extract_usable(body) == 0 then return nil end
+	return body
+end
+
+local function myip_cache_write(body)
+	local ttl = tonumber(ARGS.myip_cache_ttl) or 0
+	if ttl <= 0 then return end
+	if #myip_extract_usable(body) == 0 then return end      -- 全失败不缓存
+	local f = io.open(CACHE_FILE, "w")
+	if not f then return end
+	f:write(string.format("%d %d\n", os.time(), #body))
+	f:write(body)
+	f:close()
+end
+
+-- 命中缓存时构造与 CGI 完全一致的响应体。
+-- 必须复刻 write_padded 的首个 padding，否则前端按行 split 的逻辑
+-- 会拿到一截8192 空格（虽然多数情况下无害，但保持一致更稳）。
+local function myip_cached_response(body)
+	return string.rep(" ", 8192) .. "\n" .. (body or "") .. "\n"
+end
 
 -- -----------------------------------------------------------------------------
 -- §D HTTP 响应组装
@@ -467,6 +564,21 @@ local function write_file(path, content)
 end
 
 local function run_cgi(sock, req, path_info)
+	-- 0. myip_check 结果缓存（§C2）
+	--
+	-- 只拦这一个 CGI 端点，其余请求零开销（一次字符串 find）。
+	-- 命中则直接回放缓存；未命中则正常跑 CGI，结束后由下面的
+	-- myip_cache_write 落盘。这里**不**做后台预热 —— 那样首个访客
+	-- 仍要等10 秒，体验反而更差；让第一个访客付一次成本、后续都秒回。
+	if path_info and path_info:find("openclash/myip_check", 1, true) then
+		local cached = myip_cache_read()
+		if cached then
+			return send_status(sock, 200,
+				{["Content-Type"] = "application/json; charset=utf-8"},
+				myip_cached_response(cached))
+		end
+	end
+
 	-- 1. Content-Length 校验
 	local cl_raw = req.headers["content-length"]
 	if cl_raw then
@@ -649,6 +761,14 @@ local function run_cgi(sock, req, path_info)
 	if req.method == "HEAD" then
 		body = ""
 	end
+
+	-- myip_check：把这次的实测结果落盘（§C2）。
+	-- 放在转发之前、内容之后：body 此时已是 CGI 的完整输出，
+	-- 且失败结果（无可用 ip 行）会被 myip_cache_write 自行丢弃。
+	if path_info and path_info:find("openclash/myip_check", 1, true) then
+		myip_cache_write(body)
+	end
+
 	return send_status(sock, code, out_headers, body)
 end
 
