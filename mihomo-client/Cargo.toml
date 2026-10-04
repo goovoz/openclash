@@ -1,0 +1,30 @@
+[package]
+name = "mihomo-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Linux 无桌面 mihomo 客户端：本机代理 + 旁路由，兼容机场订阅"
+license = "MIT"
+
+[[bin]]
+name = "mihomo-client"
+path = "src/main.rs"
+
+# 依赖刻意保持最小。
+# 设计前提（见 docs/10-新项目设计/01）：协议解析、配置校验、API 安全
+# 全部委托 mihomo 内核，客户端只做「生成配置 + 管服务 + 操作界面」。
+# 因此不需要 yaml-rust 之外的解析库，也不需要 tokio 异步运行时
+# （首版全部走同步阻塞调用 —— CLI 与 systemd 场景下这不是瓶颈）。
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+dirs = "5.0"
+
+[profile.release]
+opt-level = "z"      # 体积优先：这是要部署到服务器上的二进制
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
