@@ -309,33 +309,20 @@ impl Default for ProxyGroup {
 
 /// 规则。
 ///
-/// 只支持最常用的几种类型 + RULE-SET + 逻辑组合，够用且不易写错。
-/// mihomo 支持 40+ 种，这里刻意收敛 —— 客户端不承担「教学」责任。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct Rule {
-    /// 规则类型（DOMAIN / DOMAIN-SUFFIX / IP-CIDR / GEOIP / GEOSITE /
-    /// RULE-SET / MATCH / AND / OR / NOT / SUB-RULE ...）
-    #[serde(rename = "type")]
-    pub rule_type: String,
-    /// 载荷（域名、网段、规则集名...）。逻辑规则可为空。
-    pub payload: String,
-    /// 目标：代理组名或 DIRECT / REJECT。
-    pub target: String,
-    /// 目标 IP 类规则加`no-resolve` 可跳过 DNS 解析（更快、更准）。
-    pub no_resolve: Option<bool>,
-}
-
-impl Default for Rule {
-    fn default() -> Self {
-        Self {
-            rule_type: "MATCH".into(),
-            payload: String::new(),
-            target: "PROXY".into(),
-            no_resolve: None,
-        }
-    }
-}
+/// ★ 刻意用**字符串**而不是结构体（`{type:..., payload:...}`）。
+/// mihomo 的规则本身就是单行标量 `DOMAIN-SUFFIX,example.com,PROXY`，
+/// 用户手写时一眼能看懂；做成结构体反而要在 YAML 里写三倍长度，
+/// 序列化时还要再拼回字符串。
+///
+/// 第一版用结构体，真机实测踩坑：配置里写了 3 条规则，渲染产物里
+/// **只剩 MATCH** —— serde 反序列化时字段名对不上，规则被静默跳过，
+/// 而 `mihomo -t` 校验通过（因为 MATCH 兜底合法），全程无报错。
+/// 字符串形式没有这个歧义：渲染不出来只能是渲染器的问题。
+///
+/// 支持的类型见官方 wiki config/rules（40+ 种）。这里不枚举、
+/// 原样透传给内核，由 `mihomo -t` 兜底校验。
+/// 附加参数 `no-resolve` 直接写在规则尾部即可（内核原生语法）。
+pub type Rule = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]

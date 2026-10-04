@@ -186,7 +186,10 @@ pub fn render(cfg: &Config, proxies: &[Proxy]) -> Rendered {
     let mut rules: Vec<Value> = Vec::new();
     let mut has_match = false;
     for r in &cfg.rules {
-        if r.rule_type.eq_ignore_ascii_case("match") {
+        // MATCH 必须是规则**类型**而不是以 MATCH 开头 ——
+        // `MATCH` 才是兜底，`DOMAIN,x,PROXY` 不是。
+        let kind = r.split(',').next().unwrap_or("").trim();
+        if kind.eq_ignore_ascii_case("MATCH") {
             has_match = true;
         }
         if let Some(v) = render_rule(r) {
@@ -374,21 +377,14 @@ fn render_group(
 }
 
 fn render_rule(r: &Rule) -> Option<Value> {
-    let mut s = String::new();
-    s.push_str(&r.rule_type);
-    if !r.payload.is_empty() {
-        // 逻辑规则（AND/OR/NOT/SUB-RULE）的载荷自带括号，原样带过去
-        s.push(',');
-        s.push_str(&r.payload);
+    let s = r.trim();
+    if s.is_empty() {
+        return None;
     }
-    if !r.target.is_empty() {
-        s.push(',');
-        s.push_str(&r.target);
-    }
-    if r.no_resolve == Some(true) {
-        s.push_str(",no-resolve");
-    }
-    Some(Value::String(s))
+    // 规则已经是 mihomo 原生的单行标量，直接透传。
+    // 不做「补 target」「拼 no-resolve」之类的加工 —— 那会让用户
+    // 分不清自己写的东西和客户端改过的东西。
+    Some(Value::String(s.to_string()))
 }
 
 /// 造兜底的 MATCH 规则。
@@ -468,15 +464,22 @@ pub fn precheck(cfg: &Config) -> Vec<String> {
     }
     let names: Vec<&str> = cfg.proxy_groups.iter().map(|g| g.name.as_str()).collect();
     for r in &cfg.rules {
-        let t = r.target.as_str();
+        // 规则是 mihomo 原生标量 `TYPE,payload,target`，
+        // 最后一个逗号之后是目标。逻辑规则的payload 带括号，
+        // 但目标仍在最后一逗号之后。
+        let t = match r.rsplit_once(',') {
+            Some((_, t)) => t.trim(),
+            // 只有 `MATCH` 这种无 payload 的规则才有这种情况
+            None => {
+                w.push(format!("规则 \"{r}\" 缺少目标代理组"));
+                continue;
+            }
+        };
         if t.is_empty() || is_builtin_target(t) {
             continue;
         }
         if !names.iter().any(|n| *n == t) {
-            w.push(format!(
-                "规则 {} 的目标 \"{}\" 不是已定义的代理组",
-                r.rule_type, t
-            ));
+            w.push(format!("规则 \"{r}\" 的目标 \"{t}\" 不是已定义的代理组"));
         }
     }
     if cfg.transparent.mode == TransparentMode::Tun {
